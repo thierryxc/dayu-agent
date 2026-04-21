@@ -244,15 +244,19 @@ push 后 PR 自动更新，CI 重新跑。最终 merge 时用 **Squash and merge
      - 给 PR 加 label：`full-integration`
    - 内容：
      - Ubuntu 下完整 `integration` 测试层
-     - PR 可执行的平台完整验证矩阵：
+     - PR 可执行的平台完整验证：
        - `linux-x64`
        - `windows-x64`
        - `macos-arm64`
+     - GitHub Checks 中固定展示为三个显式任务：
+       - `full-platform-validation linux-x64 (py3.11)`
+       - `full-platform-validation windows-x64 (py3.11)`
+       - `full-platform-validation macos-arm64 (py3.11)`
      - `macos-x64` 不在 PR 层阻塞，避免长期排队占用反馈时间
 
 3. `主线 / 定时 / 手工完整验证`
-   - `push main`：自动跑扩展层与主线默认平台完整验证
-   - `schedule`：每日定时跑扩展层与主线默认平台完整验证
+   - `push main`：自动跑扩展层与主线默认平台完整验证（`macos-x64` 不在 PR 层阻塞）
+   - `schedule`：每日定时跑扩展层与主线默认平台完整验证（`macos-x64` 不在 PR 层阻塞）
    - `workflow_dispatch`：可手工触发
      - 默认只跑快主链
      - 勾选 `run_extended_integration=true` 时再跑扩展 integration 层
@@ -270,12 +274,91 @@ push 后 PR 自动更新，CI 重新跑。最终 merge 时用 **Squash and merge
 - `workflow_dispatch(run_full_matrix=true, include_macos_x64=true)`
 - `release` 正式发布工作流
 
+`release` 工作流中的离线包构建也固定展开为四个显式任务：
+
+- `build-offline linux-x64 (py3.11)`
+- `build-offline windows-x64 (py3.11)`
+- `build-offline macos-arm64 (py3.11)`
+- `build-offline macos-x64 (py3.11)`
+
 这三层的设计原则是：
 
 - 主链 CI 必须包含少量真实集成 smoke
 - 更慢的真实集成测试与完整平台矩阵分层运行
 - 稀缺 runner（当前是 `macos-x64`）不放进日常阻塞层，只在手工完整验证和正式发布层收口
 - 发布前完整验证仍以 Release workflow 为准
+
+#### 当前触发对照
+
+1. 普通 PR
+   - 触发 workflow：`CI`
+   - 会跑：
+     - `pr-required min-compat (ubuntu-latest, py3.11)`
+       - 用最低支持依赖安装项目
+       - 跑 `pyright`
+       - 跑快速测试链：`pytest -m "not integration and not slow and not e2e"`
+     - `pr-required lock-smoke (linux-x64, py3.11)`
+       - 用 `constraints/lock-linux-x64-py311.txt` 安装锁定环境
+       - 跑最小真实 Docling 集成 smoke
+       - 构建 wheel
+       - 构建 `linux-x64` 离线包
+       - 对离线包做 smoke test
+   - 不会跑：
+     - `extended integration (ubuntu-latest, py3.11)`
+     - `full-platform-validation linux-x64 (py3.11)`
+     - `full-platform-validation windows-x64 (py3.11)`
+     - `full-platform-validation macos-arm64 (py3.11)`
+     - `full-platform-validation macos-x64 (py3.11)`
+
+2. PR 加 label `full-integration`
+   - 触发 workflow：`CI`
+   - 会跑普通 PR 的全部 job，并额外跑：
+     - `extended integration (ubuntu-latest, py3.11)`
+       - 用 `linux-x64` 锁定环境
+       - 跑完整 `integration and not e2e`
+     - `full-platform-validation linux-x64 (py3.11)`
+     - `full-platform-validation windows-x64 (py3.11)`
+     - `full-platform-validation macos-arm64 (py3.11)`
+       - 这三个平台完整验证 job 都会：
+         - 用各自平台的锁定依赖安装项目
+         - 跑 `pyright`
+         - 跑完整 `pytest -q --timeout=60`
+         - 构建 wheel
+         - 构建对应平台离线包
+         - 对离线包做 smoke test
+   - 仍不会跑：
+     - `full-platform-validation macos-x64 (py3.11)`
+
+3. `push main`
+   - 触发 workflow：`CI`
+   - 会跑：
+     - `pr-required min-compat (ubuntu-latest, py3.11)`
+     - `pr-required lock-smoke (linux-x64, py3.11)`
+     - `extended integration (ubuntu-latest, py3.11)`
+     - `full-platform-validation linux-x64 (py3.11)`
+     - `full-platform-validation windows-x64 (py3.11)`
+     - `full-platform-validation macos-arm64 (py3.11)`
+   - 不会跑：
+     - `full-platform-validation macos-x64 (py3.11)`
+
+4. `release`
+   - 触发 workflow：`Release Offline Bundles`
+   - 会跑：
+     - `build-wheel (py3.11)`
+       - 构建项目 wheel
+       - 上传 workflow artifact
+       - 发布到 GitHub Release asset
+     - `build-offline linux-x64 (py3.11)`
+     - `build-offline windows-x64 (py3.11)`
+     - `build-offline macos-arm64 (py3.11)`
+     - `build-offline macos-x64 (py3.11)`
+       - 这四个离线构建 job 都会：
+         - 用对应平台锁定依赖安装项目
+         - 构建 wheel
+         - 构建对应平台离线包
+         - 对离线包做 smoke test
+         - 上传 workflow artifact
+         - 发布到 GitHub Release asset
 
 ### 5. PR merge 后本地同步
 
@@ -307,6 +390,7 @@ git push lan main
 这里有一个前提要明确：
 
 - 当前 [utils/build_offline_bundle.py](</Users/leo/workspace/dayu-agent/utils/build_offline_bundle.py>) 会基于**当前运行平台**下载 wheelhouse
+- 构建脚本会把下载到的源码分发包（sdist）预先构建成 wheel，确保离线安装阶段只消费 `wheelhouse/` 中的 wheel
 - `--platform-id` 主要用于命名、安装脚本分支和归档后缀
 - 它**不是**“一台机器交叉构建任意平台离线包”的开关
 
@@ -325,11 +409,8 @@ git push lan main
 #### 7.1 `macos-arm64`（当前本机）
 
 ```bash
-source .venv/bin/activate
-python -m pip install --upgrade pip build
-rm -rf dist build
-python -m build --wheel
-python utils/build_offline_bundle.py \
+source .venv/bin/activate && python -m pip install --upgrade pip build
+rm -rf dist build && python -m build --wheel && python utils/build_offline_bundle.py \
   --wheel "$(ls dist/dayu_agent-*.whl | tail -n1)" \
   --constraints constraints/lock-macos-arm64-py311.txt \
   --platform-id macos-arm64 \
@@ -340,14 +421,19 @@ python utils/smoke_test_offline_bundle.py \
 
 #### 7.2 `macos-x64`
 
-在 Intel macOS 宿主机上执行与上面相同的流程，只把 constraints 和平台标识换掉：
+在 Intel macOS 宿主机上执行与上面相同的流程，只把 constraints 和平台标识换掉。
+
+如果这台机器是专门用来验证某个 PR，先在仓库根目录拉下对应 PR 的代码：
 
 ```bash
-source .venv/bin/activate
-python -m pip install --upgrade pip build
-rm -rf dist build
-python -m build --wheel
-python utils/build_offline_bundle.py \
+gh pr checkout <PR号> --force
+```
+
+然后再执行 `macos-x64` 的离线包构建和 smoke：
+
+```bash
+source .venv/bin/activate && python -m pip install --upgrade pip build
+rm -rf dist build && python -m build --wheel && python utils/build_offline_bundle.py \
   --wheel "$(ls dist/dayu_agent-*.whl | tail -n1)" \
   --constraints constraints/lock-macos-x64-py311.txt \
   --platform-id macos-x64 \
@@ -398,15 +484,19 @@ docker run --rm -it \
 容器内执行：
 
 ```bash
-rm -rf dist build
-python -m build --wheel
-python utils/build_offline_bundle.py \
+rm -rf dist build && python -m build --wheel && python utils/build_offline_bundle.py \
   --wheel "$(ls dist/dayu_agent-*.whl | tail -n1)" \
   --constraints constraints/lock-linux-x64-py311.txt \
   --platform-id linux-x64 \
   --output-dir dist/offline
 python utils/smoke_test_offline_bundle.py \
   --archive "$(ls dist/offline/dayu-agent-*-linux-x64-offline.tar.gz | tail -n1)"
+```
+
+若需额外手工验证，容器内执行：
+```bash
+pip install -e ".[test,dev,browser]" -c constraints/lock-macos-arm64-py311.txt
+export PATH=$PATH:/tmp/home/.local/bin
 ```
 
 #### 7.4 `windows-x64`
@@ -594,6 +684,9 @@ git pull
 git branch
 git switch feat/xxx
 git rebase main
+
+# 4. 如果这个分支已经 push 到 GitHub，rebase 后要更新远端 PR 分支
+git push --force-with-lease
 ```
 
 推荐 `rebase`：功能分支保持线性，PR review 更直观；只要分支还没 push / 没人协作就安全。已经 push 到 GitHub 的分支做 rebase，push 时要加 `--force-with-lease`。
@@ -757,6 +850,48 @@ git worktree list
 ```bash
 git tag --list 'run/*'
 ```
+
+### J. 自己的 PR 还没 merge，这时来了别人的 PR
+
+这个场景只处理一种需求：**你想先在本地验证"对方 PR + 我的 PR"合在一起会不会炸**。
+
+这不是正式开发流程的一部分，更不是让你把对方 PR merge 进自己的 `feat/xxx`。正确姿势是：**在独立 `worktree` 里做一次临时集成验证，验证完直接丢掉。**
+
+```bash
+# 1. 先保证自己当前分支的修改已经提交或 stash
+git status
+
+# 2. 基于自己的功能分支创建一个临时集成分支，并开独立 worktree
+git switch feat/xxx
+git worktree add -b integration/pr-123 ../dayu-agent-prs/pr-123-integration feat/xxx
+
+# 3. 在独立目录拉下对方 PR
+cd ../dayu-agent-prs/pr-123-integration
+git fetch github pull/123/head:pr-123
+
+# 4. 把对方 PR 临时 merge 进来做集成验证
+git merge --no-ff pr-123
+
+# 5. 跑测试 / 做验证
+git status
+
+# 6. 验证完直接删掉整个 worktree 和临时分支，不把这次 merge 带回正式分支
+cd -
+git worktree remove ../dayu-agent-prs/pr-123-integration
+git branch -D integration/pr-123
+```
+
+几点说明：
+
+- 这个 `merge` 只是为了本地验证，不是正式历史的一部分。
+- 正式流程仍然是：谁先 merge 到 `main`，另一个人后续基于最新 `main` 做 `rebase`，见[场景 A](#a-远端-main-有别人合进来的提交)。
+- 用独立 `worktree` 的目的，是把这次临时集成验证和你正式开发中的 `feat/xxx` 隔离开。
+
+不要做的事：
+
+- 不要把对方 PR `merge` 进自己的功能分支，只为了"顺手一起带上"。
+- 不要从自己的功能分支再开一个分支去承接对方 PR，制造 PR 依赖链。
+- 不要在未提交修改的工作区直接做这类本地集成验证，容易把两边改动搅在一起。
 
 ---
 

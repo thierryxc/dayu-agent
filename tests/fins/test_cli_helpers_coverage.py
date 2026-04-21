@@ -1,4 +1,4 @@
-"""fins.cli 补充覆盖测试。"""
+"""fins.cli_support 补充覆盖测试。"""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from typing import Any, Callable, cast
 
 import pytest
 
-from dayu.fins import cli as module
+from dayu.fins import cli_support as module
 from dayu.fins.ingestion.process_events import ProcessEvent, ProcessEventType
 from dayu.fins.pipelines.base import PipelineProtocol
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent, UploadMaterialEventType
-from dayu.fins.resolver.market_resolver import MarketProfile
+from dayu.fins.ticker_normalization import NormalizedTicker
 
 
 class _PipelineStub(PipelineProtocol):
@@ -61,7 +61,7 @@ class _PipelineStub(PipelineProtocol):
     def upload_filing(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -94,7 +94,7 @@ class _PipelineStub(PipelineProtocol):
     def upload_filing_stream(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -127,12 +127,14 @@ class _PipelineStub(PipelineProtocol):
     def upload_material(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         form_type: str,
         material_name: str,
         files: list[Path] | None = None,
         document_id: str | None = None,
         internal_document_id: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
         filing_date: str | None = None,
         report_date: str | None = None,
         company_id: str | None = None,
@@ -153,6 +155,8 @@ class _PipelineStub(PipelineProtocol):
                     "files": files,
                     "document_id": document_id,
                     "internal_document_id": internal_document_id,
+                    "fiscal_year": fiscal_year,
+                    "fiscal_period": fiscal_period,
                     "filing_date": filing_date,
                     "report_date": report_date,
                     "company_id": company_id,
@@ -167,12 +171,14 @@ class _PipelineStub(PipelineProtocol):
     def upload_material_stream(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         form_type: str,
         material_name: str,
         files: list[Path] | None = None,
         document_id: str | None = None,
         internal_document_id: str | None = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
         filing_date: str | None = None,
         report_date: str | None = None,
         company_id: str | None = None,
@@ -190,6 +196,8 @@ class _PipelineStub(PipelineProtocol):
             files,
             document_id,
             internal_document_id,
+            fiscal_year,
+            fiscal_period,
             filing_date,
             report_date,
             company_id,
@@ -288,13 +296,13 @@ class _PipelineStub(PipelineProtocol):
 def test_build_pipeline_for_ticker_delegates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """覆盖 ticker 解析日志与 pipeline 工厂调用路径。"""
 
-    monkeypatch.setattr(module.MarketResolver, "resolve", lambda ticker: MarketProfile(ticker=ticker, market="US"))
+    monkeypatch.setattr(module, "normalize_ticker", lambda ticker: NormalizedTicker(canonical=ticker, market="US", exchange=None, raw=ticker))
     monkeypatch.setattr(module.Log, "debug", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "get_pipeline_from_market_profile", lambda **kwargs: {"pipeline": "ok", **kwargs})
+    monkeypatch.setattr(module, "get_pipeline_from_normalized_ticker", lambda **kwargs: {"pipeline": "ok", **kwargs})
 
     result = cast(Any, module._build_pipeline_for_ticker("AAPL", tmp_path))
     assert result["pipeline"] == "ok"
-    assert result["market_profile"].ticker == "AAPL"
+    assert result["normalized_ticker"].canonical == "AAPL"
 
 
 @pytest.mark.unit
@@ -312,6 +320,8 @@ def test_dispatch_action_multiple_branches() -> None:
         files=["/tmp/a.pdf"],
         document_id=None,
         internal_document_id=None,
+        fiscal_year=None,
+        fiscal_period=None,
         filing_date=None,
         report_date=None,
         company_id="1",
@@ -513,10 +523,10 @@ def test_filename_infer_and_script_helpers(monkeypatch: pytest.MonkeyPatch, tmp_
         overwrite=True,
     )
     assert "--amended" in command and "--overwrite" in command
-    assert command.startswith("dayu-cli upload_filing --base ")
+    assert command.startswith("python -m dayu.cli upload_filing --base ")
 
     parser = module._create_parser()
-    parsed = parser.parse_args(shlex.split(command)[1:])
+    parsed = parser.parse_args(shlex.split(command)[3:])
     assert parsed.command == "upload_filing"
 
     material_command = module._build_upload_material_command(
@@ -526,23 +536,95 @@ def test_filename_infer_and_script_helpers(monkeypatch: pytest.MonkeyPatch, tmp_
         file_path=Path("/tmp/m.pdf"),
         material_forms="EARNINGS_CALL",
         material_name="call",
+        fiscal_year=None,
+        fiscal_period=None,
         filing_date=None,
         report_date=None,
         company_id=None,
         company_name=None,
         overwrite=False,
     )
-    assert material_command.startswith("dayu-cli upload_material --base ")
+    assert material_command.startswith("python -m dayu.cli upload_material --base ")
 
     script_path = tmp_path / "script.sh"
     module._write_upload_script(
         output_script=script_path,
         commands=[],
-        regenerate_command="dayu-cli upload_filings_from --ticker AAPL",
+        regenerate_command="python -m dayu.cli upload_filings_from --ticker AAPL",
         script_platform="linux",
     )
     assert "没有识别到可上传的文件" in script_path.read_text(encoding="utf-8")
-    assert "# dayu-cli upload_filings_from --ticker AAPL" in script_path.read_text(encoding="utf-8")
+    assert "# python -m dayu.cli upload_filings_from --ticker AAPL" in script_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_upload_command_builders_omit_action_when_none(tmp_path: Path) -> None:
+    """验证批量脚本命令在自动模式下不会写入 `--action`。"""
+
+    filing_command = module._build_upload_filing_command(
+        base_dir=tmp_path,
+        ticker="AAPL",
+        action=None,
+        file_path=tmp_path / "a.pdf",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+        filing_date=None,
+        report_date=None,
+        company_id=None,
+        company_name=None,
+        overwrite=False,
+    )
+    assert "--action" not in filing_command
+    assert "None" not in filing_command
+
+    material_command = module._build_upload_material_command(
+        base_dir=tmp_path,
+        ticker="AAPL",
+        action=None,
+        file_path=tmp_path / "m.pdf",
+        material_forms="MATERIAL_OTHER",
+        material_name="deck",
+        fiscal_year=None,
+        fiscal_period=None,
+        filing_date=None,
+        report_date=None,
+        company_id=None,
+        company_name=None,
+        overwrite=False,
+    )
+    assert "--action" not in material_command
+    assert "None" not in material_command
+
+
+@pytest.mark.unit
+def test_regenerate_command_omits_action_when_none(tmp_path: Path) -> None:
+    """验证重生成命令在自动模式下不会写入 `--action`。"""
+
+    args = Namespace(
+        ticker="AAPL",
+        original_ticker="AAPL",
+        action=None,
+        recursive=False,
+        amended=False,
+        infer=False,
+        filing_date=None,
+        report_date=None,
+        company_id="1",
+        company_name="Apple",
+        original_company_name="Apple",
+        overwrite=False,
+    )
+    command = module._build_upload_filings_from_regenerate_command(
+        args=args,
+        source_dir=tmp_path / "source",
+        base_dir=tmp_path,
+        output_script=tmp_path / "upload_filings_AAPL.sh",
+        script_platform="linux",
+        include_company_meta_args=True,
+    )
+    assert "--action" not in command
+    assert "None" not in command
 
 
 @pytest.mark.unit
@@ -552,15 +634,15 @@ def test_windows_script_helpers(tmp_path: Path) -> None:
     script_path = tmp_path / "script.cmd"
     module._write_upload_script(
         output_script=script_path,
-        commands=["dayu-cli upload_filing --ticker AAPL"],
-        regenerate_command='dayu-cli upload_filings_from --ticker AAPL --from "C:\\tmp"',
+        commands=["python -m dayu.cli upload_filing --ticker AAPL"],
+        regenerate_command='python -m dayu.cli upload_filings_from --ticker AAPL --from "C:\\tmp"',
         script_platform="windows",
     )
     text = script_path.read_text(encoding="utf-8")
 
     assert text.startswith("@echo off")
-    assert "REM dayu-cli upload_filings_from --ticker AAPL" in text
-    assert "upload_filing --ticker AAPL" in text
+    assert "REM python -m dayu.cli upload_filings_from --ticker AAPL" in text
+    assert "python -m dayu.cli upload_filing --ticker AAPL %*" in text
 
 
 @pytest.mark.unit

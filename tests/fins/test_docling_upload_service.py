@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import builtins
-import sys
-import types
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,9 +23,12 @@ from dayu.fins.pipelines.docling_upload_service import (
     _resolve_upsert_mode,
     _validate_source_files,
     build_cn_filing_ids,
+    build_sec_filing_ids,
     build_material_ids,
     derive_report_kind,
     normalize_cn_fiscal_period,
+    resolve_upload_action,
+    validate_material_upload_ids,
 )
 from tests.fins.storage_testkit import FsStorageTestContext, build_fs_storage_test_context
 
@@ -117,7 +118,8 @@ def test_execute_upload_create_material_success(tmp_path: Path) -> None:
 
     assert result.status == "uploaded"
     assert result.document_id == "mat_demo"
-    assert len(result.file_events) == 2
+    assert len(result.file_events) == 3
+    assert result.file_events[0].event_type == "conversion_started"
     meta = context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL)
     assert str(meta["primary_document"]).endswith("_docling.json")
     assert len(meta["files"]) == 2
@@ -166,6 +168,74 @@ def test_execute_upload_create_material_skip_when_fingerprint_same(tmp_path: Pat
     assert first_result.status == "uploaded"
     assert second_result.status == "skipped"
     assert all(event.event_type == "file_skipped" for event in second_result.file_events)
+
+
+def test_execute_upload_skip_does_not_run_docling_again_for_same_source_file(tmp_path: Path) -> None:
+    """验证相同原始文件再次上传时，会在 convert 前直接跳过。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+
+    convert_calls: list[str] = []
+
+    def _counting_convert(path: Path) -> dict[str, str]:
+        """记录 Docling convert 调用次数。
+
+        Args:
+            path: 输入文件路径。
+
+        Returns:
+            固定转换结果。
+
+        Raises:
+            无。
+        """
+
+        convert_calls.append(path.name)
+        return {"name": path.name, "source": "docling"}
+
+    context = build_fs_storage_test_context(tmp_path)
+    service = DoclingUploadService(
+        source_repository=context.source_repository,
+        blob_repository=context.blob_repository,
+        convert_with_docling=_counting_convert,
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("hello", encoding="utf-8")
+
+    first_result = service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="mat_demo",
+        internal_document_id="mat_demo",
+        form_type="MATERIAL_OTHER",
+        files=[sample_file],
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+    second_result = service.execute_upload(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="mat_demo",
+        internal_document_id="mat_demo",
+        form_type="MATERIAL_OTHER",
+        files=[sample_file],
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+
+    assert first_result.status == "uploaded"
+    assert second_result.status == "skipped"
+    assert convert_calls == ["deck.pdf"]
 
 
 def test_execute_upload_delete_material(tmp_path: Path) -> None:
@@ -454,6 +524,7 @@ def test_resolve_helpers_cover_edge_branches() -> None:
     assert _resolve_upsert_mode("create", None, False) == "create"
     assert _resolve_upsert_mode("create", {"x": 1}, True) == "update"
     assert _resolve_upsert_mode("update", {"x": 1}, False) == "update"
+    assert _resolve_upsert_mode("update", None, True) == "create"
     with pytest.raises(FileNotFoundError, match="更新目标不存在"):
         _resolve_upsert_mode("update", None, False)
     with pytest.raises(FileExistsError, match="创建目标已存在"):
@@ -472,8 +543,8 @@ def test_resolve_helpers_cover_edge_branches() -> None:
     assert derive_report_kind("Q2") == "quarterly"
 
 
-def test_build_material_and_cn_filing_ids() -> None:
-    """验证材料 ID 与 CN filing ID 的生成/校验逻辑。
+def test_build_material_and_filing_ids() -> None:
+    """验证材料 ID、CN filing ID 与 SEC filing ID 的生成逻辑。
 
     Args:
         无。
@@ -486,23 +557,36 @@ def test_build_material_and_cn_filing_ids() -> None:
     """
 
     create_doc, create_internal = build_material_ids(
-        action="create",
-        document_id=None,
-        internal_document_id=None,
+        form_type="MATERIAL_OTHER",
+        material_name="Deck",
+        fiscal_year=None,
+        fiscal_period=None,
     )
     assert create_doc.startswith("mat_")
     assert create_doc == create_internal
-    with pytest.raises(ValueError, match="materials create 要求 document_id 与 internal_document_id 一致"):
-        build_material_ids(action="create", document_id="mat_a", internal_document_id="mat_b")
-    with pytest.raises(ValueError, match="update/delete 必须提供"):
-        build_material_ids(action="update", document_id=None, internal_document_id=None)
+    with pytest.raises(ValueError, match="form_type 不能为空"):
+        build_material_ids(
+            form_type=" ",
+            material_name="Deck",
+            fiscal_year=None,
+            fiscal_period=None,
+        )
+    with pytest.raises(ValueError, match="material_name 不能为空"):
+        build_material_ids(
+            form_type="MATERIAL_OTHER",
+            material_name=" ",
+            fiscal_year=None,
+            fiscal_period=None,
+        )
     upd_doc, upd_internal = build_material_ids(
-        action="update",
-        document_id="mat_x",
-        internal_document_id=None,
+        form_type="MATERIAL_OTHER",
+        material_name="Deck",
+        fiscal_year=2025,
+        fiscal_period="q1",
     )
-    assert upd_doc == "mat_x"
-    assert upd_internal == "mat_x"
+    assert upd_doc.startswith("mat_")
+    assert upd_doc == upd_internal
+    assert upd_doc != create_doc
 
     doc_id, internal_id = build_cn_filing_ids(
         ticker="aapl",
@@ -513,6 +597,15 @@ def test_build_material_and_cn_filing_ids() -> None:
     )
     assert internal_id.startswith("cn_")
     assert doc_id == f"fil_{internal_id}"
+    sec_doc_id, sec_internal_id = build_sec_filing_ids(
+        ticker="aapl",
+        fiscal_year=2025,
+        fiscal_period="q1",
+        amended=False,
+    )
+    assert sec_internal_id.startswith("sec_")
+    assert sec_doc_id == f"fil_{sec_internal_id}"
+    assert sec_doc_id != doc_id
     with pytest.raises(ValueError, match="form_type 不能为空"):
         build_cn_filing_ids(
             ticker="AAPL",
@@ -521,6 +614,44 @@ def test_build_material_and_cn_filing_ids() -> None:
             fiscal_period="Q1",
             amended=False,
         )
+    with pytest.raises(ValueError, match="fiscal_period 不能为空"):
+        build_sec_filing_ids(
+            ticker="AAPL",
+            fiscal_year=2025,
+            fiscal_period=" ",
+            amended=False,
+        )
+
+
+def test_resolve_upload_action_and_validate_material_ids() -> None:
+    """验证自动动作解析与 material 显式 ID 一致性校验。"""
+
+    assert resolve_upload_action(None, None) == "create"
+    assert resolve_upload_action(None, {"document_id": "mat_x"}) == "update"
+    assert resolve_upload_action("delete", {"document_id": "mat_x"}) == "delete"
+
+    with pytest.raises(ValueError, match="显式 --document-id"):
+        validate_material_upload_ids(
+            stable_document_id="mat_stable",
+            stable_internal_document_id="mat_stable",
+            document_id="mat_other",
+            internal_document_id=None,
+        )
+    with pytest.raises(ValueError, match="显式 --internal-document-id"):
+        validate_material_upload_ids(
+            stable_document_id="mat_stable",
+            stable_internal_document_id="mat_stable",
+            document_id=None,
+            internal_document_id="mat_other",
+        )
+    resolved_document_id, resolved_internal_document_id = validate_material_upload_ids(
+        stable_document_id="mat_stable",
+        stable_internal_document_id="mat_stable",
+        document_id="mat_stable",
+        internal_document_id="mat_stable",
+    )
+    assert resolved_document_id == "mat_stable"
+    assert resolved_internal_document_id == "mat_stable"
 
 
 def test_build_upload_source_fingerprint_is_stable_for_order() -> None:
@@ -619,51 +750,27 @@ def test_convert_file_with_docling_conversion_failed(
     sample_file = tmp_path / "sample.pdf"
     sample_file.write_text("x", encoding="utf-8")
 
-    module_docling = types.ModuleType("docling")
-    module_datamodel = types.ModuleType("docling.datamodel")
-    module_base_models = types.ModuleType("docling.datamodel.base_models")
-    module_pipeline_options = types.ModuleType("docling.datamodel.pipeline_options")
-    module_converter = types.ModuleType("docling.document_converter")
+    def _raise_convert_failure(*args: Any, **kwargs: Any) -> Any:
+        """模拟统一 Docling 运行时在转换阶段抛错。
 
-    class _InputFormat:
-        PDF = "pdf"
+        Args:
+            *args: 位置参数。
+            **kwargs: 关键字参数。
 
-    class _TableFormerMode:
-        ACCURATE = "accurate"
+        Returns:
+            无。
 
-    class _TableOptions:
-        def __init__(self) -> None:
-            self.mode = None
-            self.do_cell_matching = False
+        Raises:
+            RuntimeError: 固定抛出。
+        """
 
-    class _PdfPipelineOptions:
-        def __init__(self) -> None:
-            self.do_ocr = False
-            self.do_table_structure = False
-            self.table_structure_options = _TableOptions()
+        _ = (args, kwargs)
+        raise RuntimeError("convert boom")
 
-    class _PdfFormatOption:
-        def __init__(self, pipeline_options: _PdfPipelineOptions) -> None:
-            self.pipeline_options = pipeline_options
-
-    class _DocumentConverter:
-        def __init__(self, format_options: dict[str, Any]) -> None:
-            self.format_options = format_options
-
-        def convert(self, _: Path) -> Any:
-            raise RuntimeError("convert boom")
-
-    cast(Any, module_base_models).InputFormat = _InputFormat
-    cast(Any, module_pipeline_options).PdfPipelineOptions = _PdfPipelineOptions
-    cast(Any, module_pipeline_options).TableFormerMode = _TableFormerMode
-    cast(Any, module_converter).DocumentConverter = _DocumentConverter
-    cast(Any, module_converter).PdfFormatOption = _PdfFormatOption
-
-    monkeypatch.setitem(sys.modules, "docling", module_docling)
-    monkeypatch.setitem(sys.modules, "docling.datamodel", module_datamodel)
-    monkeypatch.setitem(sys.modules, "docling.datamodel.base_models", module_base_models)
-    monkeypatch.setitem(sys.modules, "docling.datamodel.pipeline_options", module_pipeline_options)
-    monkeypatch.setitem(sys.modules, "docling.document_converter", module_converter)
+    monkeypatch.setattr(
+        "dayu.fins.pipelines.docling_upload_service.run_docling_pdf_conversion",
+        _raise_convert_failure,
+    )
 
     with pytest.raises(RuntimeError, match="Docling 转换失败"):
         _convert_file_with_docling(sample_file)

@@ -40,7 +40,7 @@ from dayu.fins.downloaders.sec_downloader import (
     accession_to_no_dash,
     build_source_fingerprint,
 )
-from dayu.fins.resolver.market_resolver import MarketResolver
+from dayu.fins.ticker_normalization import NormalizedTicker, normalize_ticker
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
@@ -76,13 +76,6 @@ from .tool_snapshot_export import (
     TOOL_SNAPSHOT_SCHEMA_VERSION,
     build_snapshot_file_names,
     export_tool_snapshot,
-)
-from .upload_progress_helpers import (
-    build_conversion_started_events as _build_conversion_started_events,
-    build_original_file_uploaded_events as _build_original_file_uploaded_events,
-    map_upload_file_event_to_filing_event_type as _map_upload_file_event_to_filing_event_type,
-    map_upload_file_event_to_material_event_type as _map_upload_file_event_to_material_event_type,
-    should_emit_upload_file_event as _should_emit_upload_file_event,
 )
 from .upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from .upload_material_events import UploadMaterialEvent, UploadMaterialEventType
@@ -293,7 +286,6 @@ class SecPipeline(PipelineProtocol):
         *,
         processor_registry: ProcessorRegistry,
         workspace_root: Optional[Path] = None,
-        resolver_cls: type[MarketResolver] = MarketResolver,
         downloader: Optional[SecDownloader] = None,
         company_repository: CompanyMetaRepositoryProtocol | None = None,
         source_repository: SourceDocumentRepositoryProtocol | None = None,
@@ -308,7 +300,6 @@ class SecPipeline(PipelineProtocol):
 
         Args:
             workspace_root: 工作区根目录。
-            resolver_cls: 市场解析器类型。
             downloader: 可选下载器实例。
             company_repository: 可选公司元数据仓储实例。
             source_repository: 可选源文档仓储实例。
@@ -330,7 +321,6 @@ class SecPipeline(PipelineProtocol):
         if processor_registry is None:
             raise ValueError("processor_registry 必须由调用方显式传入")
         self._workspace_root = (workspace_root or Path.cwd()).resolve()
-        self._resolver_cls = resolver_cls
         self._downloader = downloader or SecDownloader(
             workspace_root=self._workspace_root,
         )
@@ -1353,7 +1343,7 @@ class SecPipeline(PipelineProtocol):
     def upload_filing(
         self,
         ticker: str,
-        action: str,
+        action: Optional[str],
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -1369,7 +1359,7 @@ class SecPipeline(PipelineProtocol):
 
         Args:
             ticker: 股票代码。
-            action: 动作类型。
+            action: 可选动作类型；为空时自动判定。
             files: 上传文件列表。
             fiscal_year: 财年。
             fiscal_period: 财季或年度标识。
@@ -1411,7 +1401,7 @@ class SecPipeline(PipelineProtocol):
     async def upload_filing_stream(
         self,
         ticker: str,
-        action: str,
+        action: Optional[str],
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -1427,7 +1417,7 @@ class SecPipeline(PipelineProtocol):
 
         Args:
             ticker: 股票代码。
-            action: 动作类型。
+            action: 可选动作类型；为空时自动判定。
             files: 上传文件列表。
             fiscal_year: 财年。
             fiscal_period: 财季或年度标识。
@@ -1466,12 +1456,14 @@ class SecPipeline(PipelineProtocol):
     def upload_material(
         self,
         ticker: str,
-        action: str,
+        action: Optional[str],
         form_type: str,
         material_name: str,
         files: Optional[list[Path]] = None,
         document_id: Optional[str] = None,
         internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
         filing_date: Optional[str] = None,
         report_date: Optional[str] = None,
         company_id: Optional[str] = None,
@@ -1483,12 +1475,14 @@ class SecPipeline(PipelineProtocol):
 
         Args:
             ticker: 股票代码。
-            action: 动作类型。
+            action: 可选动作类型；为空时自动判定。
             form_type: 材料类型。
             material_name: 材料名称。
             files: 可选上传文件列表。
             document_id: 可选文档 ID。
             internal_document_id: 可选内部文档 ID。
+            fiscal_year: 可选财年；提供时参与稳定 document_id 生成。
+            fiscal_period: 可选财期；提供时参与稳定 document_id 生成。
             filing_date: 可选披露日期。
             report_date: 可选报告日期。
             company_id: 公司 ID。
@@ -1513,6 +1507,8 @@ class SecPipeline(PipelineProtocol):
                     files=files,
                     document_id=document_id,
                     internal_document_id=internal_document_id,
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
                     filing_date=filing_date,
                     report_date=report_date,
                     company_id=company_id,
@@ -1527,12 +1523,14 @@ class SecPipeline(PipelineProtocol):
     async def upload_material_stream(
         self,
         ticker: str,
-        action: str,
+        action: Optional[str],
         form_type: str,
         material_name: str,
         files: Optional[list[Path]] = None,
         document_id: Optional[str] = None,
         internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
         filing_date: Optional[str] = None,
         report_date: Optional[str] = None,
         company_id: Optional[str] = None,
@@ -1544,12 +1542,14 @@ class SecPipeline(PipelineProtocol):
 
         Args:
             ticker: 股票代码。
-            action: 动作类型。
+            action: 可选动作类型；为空时自动判定。
             form_type: 材料类型。
             material_name: 材料名称。
             files: 可选上传文件列表。
             document_id: 可选文档 ID。
             internal_document_id: 可选内部文档 ID。
+            fiscal_year: 可选财年；提供时参与稳定 document_id 生成。
+            fiscal_period: 可选财期；提供时参与稳定 document_id 生成。
             filing_date: 可选披露日期。
             report_date: 可选报告日期。
             company_id: 公司 ID。
@@ -1573,6 +1573,8 @@ class SecPipeline(PipelineProtocol):
             files=files,
             document_id=document_id,
             internal_document_id=internal_document_id,
+            fiscal_year=fiscal_year,
+            fiscal_period=fiscal_period,
             filing_date=filing_date,
             report_date=report_date,
             company_id=company_id,

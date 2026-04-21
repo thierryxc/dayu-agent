@@ -1,9 +1,9 @@
-"""财报域 CLI 薄层。
+"""财报域 CLI 共享辅助模块。
 
 模块职责：
-- 提供子命令风格的 CLI 入口，调用对应 Pipeline 方法。
-- 解析 `ticker` 后通过 `MarketResolver` 自动路由到 SEC/CN Pipeline。
-- 负责参数校验与基础格式转换（如 `--forms` 组装为 form 字符串）。
+- 为 `python -m dayu.cli` 提供财报命令复用的参数规范化、校验与脚本生成辅助函数。
+- 保留少量 direct-pipeline 测试需要的路由/流式收口辅助函数。
+- 不是独立 CLI 入口；对外唯一受支持的命令入口仍然是 `python -m dayu.cli`。
 
 命令风格：
 - `fins download ...`
@@ -24,15 +24,17 @@
   - `--start/--end`：日期格式支持 `YYYY`、`YYYY-MM`、`YYYY-MM-DD`。
   - `--rebuild`：基于本地已下载 filings 重建 `meta/manifest`（不重新下载）。
   - `--infer`：用 FMP 推断 alias；成功时与显式 CSV alias 合并，随后再与 SEC alias 合并，失败时回退到显式 CSV alias。
-- `upload_filing` 支持 `--action`（`create|update|delete`，默认 `create`）：
-  - `create/update` 必须提供 `--files`。
-    - 若 `meta.json` 不存在，则 `create/update` 必须提供 `--company-id`；`--company-name` 可由 `--infer` 成功后补齐。
+- `upload_filing` 支持可选 `--action`（`create|update|delete`）：
+  - 不传时按稳定 `document_id` 自动判定 `create/update`。
+  - `create/update/自动判定` 都必须提供 `--files`。
+    - 若 `meta.json` 不存在，则必须提供 `--company-id`；`--company-name` 可由 `--infer` 成功后补齐。
     - 若 `meta.json` 已存在，则重复传入 `--company-id/--company-name` 会被忽略并告警。
-- `upload_material` 需要 `--action` 与 `--forms`：
-  - `create/update` 必须提供 `--files`。
-    - 若 `meta.json` 不存在，则 `create/update` 必须提供 `--company-id`；`--company-name` 可由 `--infer` 成功后补齐。
-    - 若 `meta.json` 已存在，则重复传入 `--company-id/--company-name` 会被忽略并告警。
-  - `update/delete` 必须提供 `--document-id` 或 `--internal-document-id`。
+- `upload_material` 需要 `--forms` 与 `--material-name`，`--action` 可选：
+  - 不传时按稳定 `document_id` 自动判定 `create/update`。
+  - `create/update/自动判定` 都必须提供 `--files`。
+  - `--fiscal-year/--fiscal-period` 为可选项，提供时参与 material 稳定 `document_id` 生成。
+  - 若 `meta.json` 不存在，则必须提供 `--company-id`；`--company-name` 可由 `--infer` 成功后补齐。
+  - 若 `meta.json` 已存在，则重复传入 `--company-id/--company-name` 会被忽略并告警。
 - `upload_filings_from`：
   - 扫描目录并从文件名中识别 `fiscal_year/fiscal_period`。
     - 若 `meta.json` 不存在，则仅首条生成命令附带 `--company-id` 与 `--company-name` 以初始化公司元数据；`--infer` 成功时会把“显式 CSV alias + FMP alias”的合并结果，以及最终公司名 bake 到脚本正文。
@@ -41,9 +43,9 @@
 
 示例：
 - `python -m dayu.cli download --ticker AAPL --forms 10Q 10K DEF14A --start 2024 --end 2025-02`
-- `python -m dayu.cli upload_filing --ticker 0300 --action create --files ./tmp/a.pdf --fiscal-year 2025 --fiscal-period FY --company-id 000333 --company-name 美的集团`
+- `python -m dayu.cli upload_filing --ticker 0300 --files ./tmp/a.pdf --fiscal-year 2025 --fiscal-period FY --company-id 000333 --company-name 美的集团`
 - `python -m dayu.cli upload_filings_from --ticker 0300 --from ./workspace/source --output ./workspace/upload_0300.sh`
-- `python -m dayu.cli upload_material --ticker AAPL --action update --forms MATERIAL_OTHER --material-name deck --document-id mat_xxx --files ./tmp/deck.pdf --company-id 320193 --company-name "Apple Inc."`
+- `python -m dayu.cli upload_material --ticker AAPL --forms MATERIAL_OTHER --material-name deck --files ./tmp/deck.pdf --company-id 320193 --company-name "Apple Inc."`
 - `python -m dayu.cli process --ticker AAPL --overwrite`
 """
 
@@ -63,11 +65,11 @@ from typing import Any, AsyncIterator, Optional
 from dayu.log import Log, LogLevel
 
 from .ingestion.process_events import ProcessEvent
-from .pipelines import PipelineProtocol, get_pipeline_from_market_profile
+from .pipelines import PipelineProtocol, get_pipeline_from_normalized_ticker
 from .pipelines.download_events import DownloadEvent
 from .pipelines.upload_filing_events import UploadFilingEvent
 from .pipelines.upload_material_events import UploadMaterialEvent
-from .resolver.market_resolver import MarketResolver
+from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
 from .resolver.fmp_company_alias_resolver import (
     FmpAliasInferenceError,
     infer_company_aliases_from_fmp,
@@ -120,6 +122,9 @@ from .storage.fs_company_meta_repository import FsCompanyMetaRepository
 
 MODULE = "FINS.CLI"
 _TICKER_CSV_COMMANDS = frozenset({"download", "upload_filing", "upload_material", "upload_filings_from"})
+_UPLOAD_SCRIPT_UNIX_PASSTHROUGH_ARGS = '"$@"'
+_UPLOAD_SCRIPT_WINDOWS_PASSTHROUGH_ARGS = "%*"
+_UPLOAD_SCRIPT_CLI_PREFIX = ("python", "-m", "dayu.cli")
 
 
 @dataclass(frozen=True)
@@ -303,9 +308,9 @@ def _add_upload_filing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--action",
         dest="action",
-        default="create",
+        default=None,
         choices=["create", "update", "delete"],
-        help="财报动作类型（默认 create）",
+        help="财报动作类型（默认仅自动判定 create/update；delete 必须显式传入）",
     )
     parser.add_argument("--files", nargs="+", default=None, help="上传文件列表")
     parser.add_argument("--fiscal-year", dest="fiscal_year", type=int, required=True, help="财年")
@@ -360,20 +365,27 @@ def _add_upload_material_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--action",
         dest="action",
-        required=True,
+        default=None,
         choices=["create", "update", "delete"],
-        help="材料动作类型",
+        help="材料动作类型（默认仅自动判定 create/update；delete 必须显式传入）",
     )
     parser.add_argument("--forms", dest="form_type", required=True, help="材料 form_type")
     parser.add_argument("--material-name", dest="material_name", required=True, help="材料名称")
     parser.add_argument("--files", nargs="+", default=None, help="上传文件列表")
-    parser.add_argument("--document-id", dest="document_id", default=None, help="文档 ID")
+    parser.add_argument(
+        "--document-id",
+        dest="document_id",
+        default=None,
+        help="文档 ID；若传入则必须与按 form_type/material_name/fiscal 生成的稳定 ID 一致",
+    )
     parser.add_argument(
         "--internal-document-id",
         dest="internal_document_id",
         default=None,
-        help="内部文档 ID",
+        help="内部文档 ID；material 场景下与 document_id 恒等，若传入则必须与稳定 ID 一致",
     )
+    parser.add_argument("--fiscal-year", dest="fiscal_year", type=int, default=None, help="可选财年")
+    parser.add_argument("--fiscal-period", dest="fiscal_period", default=None, help="可选财期")
     parser.add_argument("--filing-date", dest="filing_date", default=None, help="可选披露日期")
     parser.add_argument("--report-date", dest="report_date", default=None, help="可选报告日期")
     parser.add_argument(
@@ -424,9 +436,9 @@ def _add_upload_filings_from_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--action",
         dest="action",
-        default="create",
+        default=None,
         choices=["create", "update"],
-        help="生成脚本中的上传动作（默认 create）",
+        help="可选生成脚本中的固定上传动作（默认留空，执行时自动判定）",
     )
     parser.add_argument(
         "--output",
@@ -536,6 +548,28 @@ def _normalize_cli_ticker_token(raw_token: str) -> str:
     return compact_token.upper()
 
 
+def _canonicalize_ticker_token(raw_token: str) -> str:
+    """把任意 ticker / alias token 归一到 canonical，失败则回退大写去空白。
+
+    业务动机：meta 中的 ticker alias 要求跨市场归一形态（如 ``9988.HK`` → ``9988``），
+    让工具查询时无论传哪个变形都能命中同一公司。
+
+    Args:
+        raw_token: 原始 token，可能是合法 ticker 变形，也可能是公司名/别名。
+
+    Returns:
+        归一化后的 canonical；无法识别时回退到 ``strip().upper()``。
+
+    Raises:
+        无。
+    """
+
+    token_normalized = try_normalize_ticker(raw_token)
+    if token_normalized is not None:
+        return token_normalized.canonical
+    return _normalize_cli_ticker_token(raw_token)
+
+
 def _merge_ticker_alias_groups(
     *,
     canonical_ticker: str,
@@ -554,13 +588,13 @@ def _merge_ticker_alias_groups(
         ValueError: 规范 ticker 为空时抛出。
     """
 
-    normalized_canonical = _normalize_cli_ticker_token(canonical_ticker)
+    normalized_canonical = _canonicalize_ticker_token(canonical_ticker)
     if not normalized_canonical:
         raise ValueError("ticker 不能为空")
     merged_aliases: list[str] = [normalized_canonical]
     for alias_group in alias_groups:
         for raw_alias in alias_group or []:
-            normalized_alias = _normalize_cli_ticker_token(str(raw_alias))
+            normalized_alias = _canonicalize_ticker_token(str(raw_alias))
             if not normalized_alias or normalized_alias in merged_aliases:
                 continue
             merged_aliases.append(normalized_alias)
@@ -595,7 +629,14 @@ def _parse_ticker_argument(raw_ticker: str) -> _ParsedTickerArgument:
     - 单值：`BABA`
     - CSV：`BABA,9988,9988.HK`
 
-    其中首个 token 永远视为 canonical ticker。
+    语义：**CSV 中每个 token 都走 `try_normalize_ticker` 真源归一化**；归一化成功
+    的 token 取其 canonical，失败的（可能是公司名）回退到 ``strip().upper()``。随
+    后对所有归一化结果统一去重：首个出现的作为 canonical，其余作为显式 alias。
+    保留"公司名当 ticker 传"的既有行为。
+
+    业务动机：CSV 的用途是把同一公司跨市场上市的多个 ticker（例如
+    ``BABA,9988``）整体作为 alias 写入 meta，让工具查询时无论传哪个变形都能命中。
+    因此每个 token 都需要归一化到 canonical，再整体去重。
 
     Args:
         raw_ticker: 原始 `--ticker` 输入。
@@ -610,19 +651,23 @@ def _parse_ticker_argument(raw_ticker: str) -> _ParsedTickerArgument:
     raw_value = str(raw_ticker or "").strip()
     if not raw_value:
         raise ValueError("--ticker 不能为空")
-    raw_tokens = [token for token in raw_value.split(",")]
-    normalized_tokens = [
-        _normalize_cli_ticker_token(token)
-        for token in raw_tokens
-        if _normalize_cli_ticker_token(token)
-    ]
+    raw_tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+    if not raw_tokens:
+        raise ValueError("--ticker 不能为空")
+
+    normalized_tokens: list[str] = []
+    for token in raw_tokens:
+        candidate = _canonicalize_ticker_token(token)
+        if not candidate or candidate in normalized_tokens:
+            continue
+        normalized_tokens.append(candidate)
+
     if not normalized_tokens:
         raise ValueError("--ticker 不能为空")
+
     canonical_ticker = normalized_tokens[0]
-    explicit_aliases = _merge_ticker_alias_groups(
-        canonical_ticker=canonical_ticker,
-        alias_groups=[normalized_tokens[1:]],
-    )[1:]
+    explicit_aliases = normalized_tokens[1:]
+
     return _ParsedTickerArgument(
         raw_value=raw_value,
         canonical_ticker=canonical_ticker,
@@ -815,7 +860,7 @@ def _prepare_upload_like_args(args: argparse.Namespace) -> None:
     if args.existing_company_meta is not None:
         return
     _validate_company_meta_args(
-        action_name=getattr(args, "action", "create"),
+        action_name=getattr(args, "action", None),
         company_id=getattr(args, "company_id", None),
         company_name=getattr(args, "company_name", None),
         command_name=args.command,
@@ -866,14 +911,14 @@ def _build_pipeline_for_ticker(
         ValueError: ticker 不合法时抛出。
     """
 
-    market_profile = MarketResolver.resolve(ticker)
+    normalized_ticker = normalize_ticker(ticker)
     Log.debug(
-        f"ticker 解析完成: ticker={market_profile.ticker} "
-        f"market={market_profile.market}",
+        f"ticker 解析完成: ticker={normalized_ticker.canonical} "
+        f"market={normalized_ticker.market}",
         module=MODULE,
     )
-    return get_pipeline_from_market_profile(
-        market_profile=market_profile,
+    return get_pipeline_from_normalized_ticker(
+        normalized_ticker=normalized_ticker,
         workspace_root=workspace_root,
     )
 
@@ -945,6 +990,8 @@ def _dispatch_action(
             files=_to_paths(args.files),
             document_id=args.document_id,
             internal_document_id=args.internal_document_id,
+            fiscal_year=args.fiscal_year,
+            fiscal_period=args.fiscal_period,
             filing_date=args.filing_date,
             report_date=args.report_date,
             company_id=args.company_id,
@@ -1027,6 +1074,8 @@ def _dispatch_upload_action_with_stream_feedback(
             files=_to_paths(args.files),
             document_id=args.document_id,
             internal_document_id=args.internal_document_id,
+            fiscal_year=args.fiscal_year,
+            fiscal_period=args.fiscal_period,
             filing_date=args.filing_date,
             report_date=args.report_date,
             company_id=args.company_id,
@@ -1277,18 +1326,16 @@ def _validate_upload_material_args(args: argparse.Namespace) -> None:
 
     # 规范化 form_type 为大写，确保与内部映射表（大写键）对齐，同时兼容用户小写输入
     args.form_type = args.form_type.strip().upper()
+    if getattr(args, "fiscal_period", None):
+        args.fiscal_period = str(args.fiscal_period).strip().upper()
     if args.form_type not in VALID_MATERIAL_FORM_TYPES:
         raise ValueError(
             f"--forms '{args.form_type}' 不是合法的 material form_type，"
             f"支持的值：{sorted(VALID_MATERIAL_FORM_TYPES)}"
         )
-    action_name = args.action
-    if action_name in {"create", "update"} and not args.files:
-        raise ValueError("upload_material 在 create/update 时必须提供 --files")
-    if action_name in {"update", "delete"} and not (args.document_id or args.internal_document_id):
-        raise ValueError(
-            "upload_material 在 update/delete 时必须提供 --document-id 或 --internal-document-id"
-        )
+    action_name = str(args.action or "").strip().lower()
+    if action_name in {"", "create", "update"} and not args.files:
+        raise ValueError("upload_material 在自动判定/create/update 时必须提供 --files")
 
 
 def _validate_upload_filing_args(args: argparse.Namespace) -> None:
@@ -1304,14 +1351,14 @@ def _validate_upload_filing_args(args: argparse.Namespace) -> None:
         ValueError: 当动作与参数组合不合法时抛出。
     """
 
-    action_name = str(args.action).strip().lower()
-    if action_name in {"create", "update"} and not args.files:
-        raise ValueError("upload_filing 在 create/update 时必须提供 --files")
+    action_name = str(args.action or "").strip().lower()
+    if action_name in {"", "create", "update"} and not args.files:
+        raise ValueError("upload_filing 在自动判定/create/update 时必须提供 --files")
 
 
 def _validate_company_meta_args(
     *,
-    action_name: str,
+    action_name: Optional[str],
     company_id: Optional[str],
     company_name: Optional[str],
     command_name: str,
@@ -1331,13 +1378,13 @@ def _validate_company_meta_args(
         ValueError: create/update 缺失 company meta 时抛出。
     """
 
-    normalized_action = str(action_name).strip().lower()
-    if normalized_action not in {"create", "update"}:
+    normalized_action = str(action_name or "").strip().lower()
+    if normalized_action == "delete":
         return
     if not str(company_id or "").strip():
-        raise ValueError(f"{command_name} 在 create/update 时必须提供 --company-id")
+        raise ValueError(f"{command_name} 在自动判定/create/update 时必须提供 --company-id")
     if not str(company_name or "").strip():
-        raise ValueError(f"{command_name} 在 create/update 时必须提供 --company-name")
+        raise ValueError(f"{command_name} 在自动判定/create/update 时必须提供 --company-name")
 
 
 def _generate_upload_filings_script(args: argparse.Namespace) -> dict[str, Any]:
@@ -1405,11 +1452,18 @@ def _generate_upload_filings_script(args: argparse.Namespace) -> dict[str, Any]:
             matched_form_type = matched_form_type and args.material_forms
         if matched_form_type is not None:
             mat_name = _derive_material_name(file_path.name, parent_dir_name=file_path.parent.name)
+            inferred_material_fiscal = _infer_fiscal_from_path(file_path)
             material_entries.append(
                 {
                     "file": str(file_path),
                     "material_name": mat_name,
                     "material_forms": matched_form_type,
+                    "fiscal_year": (
+                        inferred_material_fiscal[0] if inferred_material_fiscal is not None else None
+                    ),
+                    "fiscal_period": (
+                        inferred_material_fiscal[1] if inferred_material_fiscal is not None else None
+                    ),
                 }
             )
             continue
@@ -1632,7 +1686,7 @@ def _build_upload_filings_from_regenerate_command(
     """
 
     parts = [
-        "dayu-cli",
+        *_UPLOAD_SCRIPT_CLI_PREFIX,
         "upload_filings_from",
         "--ticker",
         str(getattr(args, "original_ticker", args.ticker)),
@@ -1643,7 +1697,7 @@ def _build_upload_filings_from_regenerate_command(
         "--output",
         str(output_script),
     ]
-    if getattr(args, "action", "create") != "create":
+    if getattr(args, "action", None):
         parts.extend(["--action", str(args.action)])
     if bool(getattr(args, "recursive", False)):
         parts.append("--recursive")
@@ -1672,10 +1726,12 @@ def _build_upload_material_command(
     *,
     base_dir: Path,
     ticker: str,
-    action: str,
+    action: Optional[str],
     file_path: Path,
     material_forms: str,
     material_name: str,
+    fiscal_year: Optional[int],
+    fiscal_period: Optional[str],
     filing_date: Optional[str],
     report_date: Optional[str],
     company_id: Optional[str],
@@ -1687,10 +1743,12 @@ def _build_upload_material_command(
     Args:
         base_dir: CLI 工作区目录。
         ticker: 股票代码或已 bake 的 ticker CSV。
-        action: 上传动作。
+        action: 可选上传动作。
         file_path: 文件路径。
         material_forms: material form_type（如 ``FINANCIAL_STATEMENTS``）。
         material_name: 材料名称。
+        fiscal_year: 可选财年。
+        fiscal_period: 可选财期。
         filing_date: 披露日期。
         report_date: 报告日期。
         company_id: 公司 ID。
@@ -1705,14 +1763,12 @@ def _build_upload_material_command(
     """
 
     parts = [
-        "dayu-cli",
+        *_UPLOAD_SCRIPT_CLI_PREFIX,
         "upload_material",
         "--base",
         str(base_dir),
         "--ticker",
         ticker,
-        "--action",
-        action,
         "--forms",
         material_forms,
         "--material-name",
@@ -1720,6 +1776,12 @@ def _build_upload_material_command(
         "--files",
         str(file_path),
     ]
+    if action:
+        parts.extend(["--action", action])
+    if fiscal_year is not None:
+        parts.extend(["--fiscal-year", str(fiscal_year)])
+    if fiscal_period:
+        parts.extend(["--fiscal-period", fiscal_period])
     if company_id:
         parts.extend(["--company-id", company_id])
     if company_name:
@@ -1737,7 +1799,7 @@ def _build_upload_filing_command(
     *,
     base_dir: Path,
     ticker: str,
-    action: str,
+    action: Optional[str],
     file_path: Path,
     fiscal_year: int,
     fiscal_period: str,
@@ -1753,7 +1815,7 @@ def _build_upload_filing_command(
     Args:
         base_dir: CLI 工作区目录。
         ticker: 股票代码或已 bake 的 ticker CSV。
-        action: 上传动作。
+        action: 可选上传动作。
         file_path: 文件路径。
         fiscal_year: 财年。
         fiscal_period: 财期。
@@ -1772,14 +1834,12 @@ def _build_upload_filing_command(
     """
 
     parts = [
-        "dayu-cli",
+        *_UPLOAD_SCRIPT_CLI_PREFIX,
         "upload_filing",
         "--base",
         str(base_dir),
         "--ticker",
         ticker,
-        "--action",
-        action,
         "--files",
         str(file_path),
         "--fiscal-year",
@@ -1787,6 +1847,8 @@ def _build_upload_filing_command(
         "--fiscal-period",
         fiscal_period,
     ]
+    if action:
+        parts.extend(["--action", action])
     if company_id:
         parts.extend(["--company-id", company_id])
     if company_name:
@@ -1808,7 +1870,7 @@ def _attach_upload_commands(
     material_entries: list[dict[str, Any]],
     base_dir: Path,
     ticker: str,
-    action: str,
+    action: Optional[str],
     amended: bool,
     filing_date: Optional[str],
     report_date: Optional[str],
@@ -1824,7 +1886,7 @@ def _attach_upload_commands(
         material_entries: 已保留的 material 条目。
         base_dir: CLI 工作区目录。
         ticker: 股票代码。
-        action: 上传动作。
+        action: 可选上传动作。
         amended: 是否修订版。
         filing_date: 披露日期。
         report_date: 报告日期。
@@ -1868,6 +1930,12 @@ def _attach_upload_commands(
             file_path=Path(entry["file"]),
             material_forms=str(entry["material_forms"]),
             material_name=str(entry["material_name"]),
+            fiscal_year=(
+                int(entry["fiscal_year"]) if entry.get("fiscal_year") is not None else None
+            ),
+            fiscal_period=(
+                str(entry["fiscal_period"]) if entry.get("fiscal_period") is not None else None
+            ),
             filing_date=filing_date,
             report_date=report_date,
             company_id=company_id if include_company_meta else None,
@@ -1999,7 +2067,13 @@ def _write_upload_script(
         regenerate_command=regenerate_command,
     )
     if commands:
-        lines.extend(commands)
+        lines.extend(
+            _append_upload_script_passthrough_args(
+                command=command,
+                script_platform=script_platform,
+            )
+            for command in commands
+        )
     else:
         if script_platform == "windows":
             lines.append("echo 没有识别到可上传的文件")
@@ -2009,6 +2083,25 @@ def _write_upload_script(
     output_script.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if script_platform != "windows":
         output_script.chmod(0o755)
+
+
+def _append_upload_script_passthrough_args(*, command: str, script_platform: str) -> str:
+    """为批量上传脚本中的单条命令追加调用时透传参数。
+
+    Args:
+        command: 已拼装完成的单条命令。
+        script_platform: 脚本平台标识。
+
+    Returns:
+        追加透传参数后的命令字符串。
+
+    Raises:
+        无。
+    """
+
+    if script_platform == "windows":
+        return f"{command} {_UPLOAD_SCRIPT_WINDOWS_PASSTHROUGH_ARGS}"
+    return f"{command} {_UPLOAD_SCRIPT_UNIX_PASSTHROUGH_ARGS}"
 
 
 def _configure_logging(

@@ -16,13 +16,15 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
-import uuid
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional
 
-from dayu.docling_runtime import build_docling_pdf_converter
+from dayu.docling_runtime import (
+    DoclingRuntimeInitializationError,
+    run_docling_pdf_conversion,
+)
 from dayu.fins.domain.document_models import (
     SourceHandle,
     SourceDocumentStateChangeRequest,
@@ -31,6 +33,7 @@ from dayu.fins.domain.document_models import (
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import DocumentBlobRepositoryProtocol, SourceDocumentRepositoryProtocol
+from dayu.fins.ticker_normalization import try_normalize_ticker
 from dayu.log import Log
 
 SUPPORTED_UPLOAD_SUFFIXES = frozenset(
@@ -190,11 +193,11 @@ class DoclingUploadService:
 
         validated_files = _validate_source_files(files)
         previous_meta = self._safe_get_document_meta(normalized_ticker, document_id, source_kind)
-        if normalized_action == "update" and previous_meta is None:
+        if normalized_action == "update" and previous_meta is None and not overwrite:
             raise FileNotFoundError(f"Document not found for update: {document_id}")
 
-        pending_assets = self._build_pending_assets(validated_files)
-        source_fingerprint = _build_upload_source_fingerprint(pending_assets)
+        original_assets = self._build_original_assets(validated_files)
+        source_fingerprint = _build_upload_source_fingerprint(original_assets)
         if _can_skip_upload(previous_meta, source_fingerprint, overwrite):
             Log.info(
                 f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
@@ -213,8 +216,9 @@ class DoclingUploadService:
                 },
             )
 
+        pending_assets, conversion_events = self._build_pending_assets(validated_files, original_assets)
         stored_entries: list[dict[str, Any]] = []
-        file_events: list[UploadFileEventPayload] = []
+        file_events: list[UploadFileEventPayload] = list(conversion_events)
         handle = SourceHandle(
             ticker=normalized_ticker,
             document_id=document_id,
@@ -390,17 +394,18 @@ class DoclingUploadService:
             )
         )
 
-    def _build_pending_assets(self, files: list[Path]) -> list[_PendingFileAsset]:
-        """构建待上传资产列表。
+    def _build_original_assets(self, files: list[Path]) -> list[_PendingFileAsset]:
+        """构建原始上传文件资产列表。
 
         Args:
             files: 源文件列表。
 
         Returns:
-            待上传资产列表（含原始文件与 docling 文件）。
+            仅包含原始上传文件的资产列表。
 
         Raises:
-            RuntimeError: Docling 转换失败时抛出。
+            FileNotFoundError: 源文件不存在时抛出。
+            OSError: 源文件读取失败时抛出。
         """
 
         assets: list[_PendingFileAsset] = []
@@ -418,6 +423,39 @@ class DoclingUploadService:
                     source="original",
                 )
             )
+        return assets
+
+    def _build_pending_assets(
+        self,
+        files: list[Path],
+        original_assets: list[_PendingFileAsset],
+    ) -> tuple[list[_PendingFileAsset], list[UploadFileEventPayload]]:
+        """构建待上传资产列表与转换阶段事件。
+
+        Args:
+            files: 源文件列表。
+            original_assets: 已读取完成的原始文件资产列表。
+
+        Returns:
+            `(待上传资产列表, 转换阶段事件列表)` 二元组。
+
+        Raises:
+            RuntimeError: Docling 转换失败时抛出。
+        """
+
+        assets = list(original_assets)
+        conversion_events: list[UploadFileEventPayload] = []
+        for file_path in files:
+            conversion_events.append(
+                UploadFileEventPayload(
+                    event_type="conversion_started",
+                    name=file_path.name,
+                    payload={
+                        "source": "docling",
+                        "message": "正在 convert",
+                    },
+                )
+            )
             docling_payload = self._convert_with_docling(file_path)
             docling_data = json.dumps(docling_payload, ensure_ascii=False, indent=2).encode("utf-8")
             docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
@@ -432,7 +470,7 @@ class DoclingUploadService:
                     source="docling",
                 )
             )
-        return assets
+        return assets, conversion_events
 
     def _build_upsert_meta(
         self,
@@ -539,19 +577,20 @@ def _convert_file_with_docling(file_path: Path) -> dict[str, Any]:
     """
 
     try:
-        converter = build_docling_pdf_converter(
+        result = run_docling_pdf_conversion(
+            lambda converter: converter.convert(file_path),
             do_ocr=True,
             do_table_structure=True,
             table_mode="accurate",
             do_cell_matching=True,
         )
-    except Exception as exc:
-        raise RuntimeError(f"Docling 转换器初始化失败: {exc}") from exc
-    try:
-        result = converter.convert(file_path)
+    except DoclingRuntimeInitializationError:
+        raise
     except Exception as exc:  # pragma: no cover - 第三方异常兜底
         raise RuntimeError(f"Docling 转换失败: {file_path.name}") from exc
     return result.document.export_to_dict()
+
+
 def _validate_source_files(files: list[Path]) -> list[Path]:
     """校验上传文件列表。
 
@@ -692,6 +731,8 @@ def _resolve_upsert_mode(action: str, previous_meta: Optional[dict[str, Any]], o
 
     if action == "update":
         if previous_meta is None:
+            if overwrite:
+                return "create"
             raise FileNotFoundError("更新目标不存在")
         return "update"
     if previous_meta is None:
@@ -751,6 +792,9 @@ def _increment_document_version(previous_version: str) -> str:
 def _normalize_ticker(ticker: str) -> str:
     """标准化 ticker。
 
+    代理到 ``dayu.fins.ticker_normalization`` 真源；识别失败时回退到
+    ``strip().upper()`` 以保留空值校验。
+
     Args:
         ticker: 原始 ticker。
 
@@ -761,6 +805,9 @@ def _normalize_ticker(ticker: str) -> str:
         ValueError: ticker 为空时抛出。
     """
 
+    normalized_source = try_normalize_ticker(ticker)
+    if normalized_source is not None:
+        return normalized_source.canonical
     normalized = ticker.strip().upper()
     if not normalized:
         raise ValueError("ticker 不能为空")
@@ -769,44 +816,152 @@ def _normalize_ticker(ticker: str) -> str:
 
 def build_material_ids(
     *,
-    action: str,
-    document_id: Optional[str],
-    internal_document_id: Optional[str],
+    form_type: str,
+    material_name: str,
+    fiscal_year: Optional[int],
+    fiscal_period: Optional[str],
 ) -> tuple[str, str]:
-    """生成或校验材料文档 ID 对。
+    """生成稳定材料文档 ID 对。
+
+    当前 material 上传场景下，`document_id` 与 `internal_document_id`
+    采用同一套稳定身份，因此返回值二元组中的两个字段恒等。
 
     Args:
-        action: 上传动作。
-        document_id: 外部传入 document_id。
-        internal_document_id: 外部传入 internal_document_id。
+        form_type: 材料 form_type。
+        material_name: 材料名称。
+        fiscal_year: 可选财年。
+        fiscal_period: 可选财期。
 
     Returns:
         `(document_id, internal_document_id)`。
 
     Raises:
-        ValueError: 参数组合非法时抛出。
+        ValueError: 参数非法时抛出。
     """
 
-    normalized_action = action.strip().lower()
+    normalized_form_type = form_type.strip().upper()
+    normalized_material_name = material_name.strip()
+    normalized_period = _normalize_optional_upload_fiscal_period(fiscal_period)
+    if not normalized_form_type:
+        raise ValueError("form_type 不能为空")
+    if not normalized_material_name:
+        raise ValueError("material_name 不能为空")
+    seed_parts = [normalized_form_type, normalized_material_name]
+    if fiscal_year is not None:
+        seed_parts.append(str(fiscal_year))
+    if normalized_period is not None:
+        seed_parts.append(normalized_period)
+    digest = hashlib.sha1("|".join(seed_parts).encode("utf-8")).hexdigest()
+    material_document_id = f"mat_{digest}"
+    return material_document_id, material_document_id
+
+
+def validate_material_upload_ids(
+    *,
+    stable_document_id: str,
+    stable_internal_document_id: str,
+    document_id: Optional[str],
+    internal_document_id: Optional[str],
+) -> tuple[str, str]:
+    """校验显式传入的材料文档 ID 与稳定 ID 是否一致。
+
+    Args:
+        stable_document_id: 按稳定规则生成的 document_id。
+        stable_internal_document_id: 按稳定规则生成的 internal_document_id。
+        document_id: 外部传入的 document_id。
+        internal_document_id: 外部传入的 internal_document_id。
+
+    Returns:
+        稳定 ID 对 `(document_id, internal_document_id)`。
+
+    Raises:
+        ValueError: 显式 ID 与稳定 ID 不一致时抛出。
+    """
+
     normalized_document_id = str(document_id or "").strip()
-    normalized_internal_id = str(internal_document_id or "").strip()
+    normalized_internal_document_id = str(internal_document_id or "").strip()
+    if normalized_document_id and normalized_document_id != stable_document_id:
+        raise ValueError(
+            "显式 --document-id 与按 form_type/material_name/fiscal 生成的稳定 document_id 不一致"
+        )
+    if normalized_internal_document_id and normalized_internal_document_id != stable_internal_document_id:
+        raise ValueError(
+            "显式 --internal-document-id 与按 form_type/material_name/fiscal 生成的稳定 internal_document_id 不一致"
+        )
+    return stable_document_id, stable_internal_document_id
 
-    if normalized_action == "create":
-        if not normalized_internal_id:
-            normalized_internal_id = f"mat_{uuid.uuid4().hex}"
-        if not normalized_document_id:
-            normalized_document_id = normalized_internal_id
-        if normalized_document_id != normalized_internal_id:
-            raise ValueError("materials create 要求 document_id 与 internal_document_id 一致")
-        return normalized_document_id, normalized_internal_id
 
-    if not normalized_document_id and not normalized_internal_id:
-        raise ValueError("update/delete 必须提供 document_id 或 internal_document_id")
-    if not normalized_internal_id:
-        normalized_internal_id = normalized_document_id
-    if not normalized_document_id:
-        normalized_document_id = normalized_internal_id
-    return normalized_document_id, normalized_internal_id
+def resolve_upload_action(
+    requested_action: Optional[str],
+    previous_meta: Optional[dict[str, Any]],
+) -> str:
+    """根据显式动作与现有文档状态解析最终上传动作。
+
+    自动判定仅覆盖 `create/update`：
+    - 显式传入 `delete` 时，直接返回 `delete`
+    - 未显式传入动作且目标不存在时，返回 `create`
+    - 未显式传入动作且目标已存在时，返回 `update`
+
+    因此删除动作必须由调用方显式传入，不能通过自动判定得到。
+
+    Args:
+        requested_action: 用户显式传入的动作；缺失时为 `None`。
+        previous_meta: 现有源文档 meta；不存在时为 `None`。
+
+    Returns:
+        最终动作字符串，仅可能为 `create`、`update` 或 `delete`。
+
+    Raises:
+        ValueError: 显式动作非法时抛出。
+    """
+
+    normalized_action = _normalize_optional_upload_action(requested_action)
+    if normalized_action is not None:
+        return normalized_action
+    if previous_meta is None:
+        return "create"
+    return "update"
+
+
+def reset_upload_target_for_overwrite(
+    *,
+    source_repository: SourceDocumentRepositoryProtocol,
+    ticker: str,
+    document_id: str,
+    source_kind: SourceKind,
+    action: str,
+    overwrite: bool,
+    previous_meta: Optional[dict[str, Any]],
+) -> None:
+    """在覆盖模式下重置当前上传目标。
+
+    Args:
+        source_repository: 源文档仓储实现。
+        ticker: 股票代码。
+        document_id: 文档 ID。
+        source_kind: 来源类型。
+        action: 已解析的最终动作。
+        overwrite: 是否开启覆盖模式。
+        previous_meta: 当前目标的既有 meta；不存在时为 `None`。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 仓储重置失败时抛出。
+    """
+
+    if not overwrite:
+        return
+    if previous_meta is None:
+        return
+    if action not in {"create", "update"}:
+        return
+    source_repository.reset_source_document(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
 
 
 def build_cn_filing_ids(
@@ -843,6 +998,79 @@ def build_cn_filing_ids(
     internal_document_id = f"cn_{digest}"
     document_id = f"fil_{internal_document_id}"
     return document_id, internal_document_id
+
+
+def build_sec_filing_ids(
+    *,
+    ticker: str,
+    fiscal_year: int,
+    fiscal_period: str,
+    amended: bool,
+) -> tuple[str, str]:
+    """生成美股 filing 文档 ID 对。
+
+    Args:
+        ticker: 股票代码。
+        fiscal_year: 财年。
+        fiscal_period: 财期。
+        amended: 是否修订版。
+
+    Returns:
+        `(document_id, internal_document_id)`。
+
+    Raises:
+        ValueError: 参数非法时抛出。
+    """
+
+    normalized_ticker = _normalize_ticker(ticker)
+    normalized_period = fiscal_period.strip().upper()
+    if not normalized_period:
+        raise ValueError("fiscal_period 不能为空")
+    seed = f"{normalized_ticker}|{fiscal_year}|{normalized_period}|{int(amended)}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+    internal_document_id = f"sec_{digest}"
+    document_id = f"fil_{internal_document_id}"
+    return document_id, internal_document_id
+
+
+def _normalize_optional_upload_action(action: Optional[str]) -> Optional[str]:
+    """标准化可选上传动作。
+
+    Args:
+        action: 原始动作。
+
+    Returns:
+        标准化后的动作；空值返回 `None`。
+
+    Raises:
+        ValueError: 动作不在支持集合时抛出。
+    """
+
+    normalized_action = str(action or "").strip().lower()
+    if not normalized_action:
+        return None
+    if normalized_action not in UPLOAD_ACTIONS:
+        raise ValueError(f"不支持的 action: {action}")
+    return normalized_action
+
+
+def _normalize_optional_upload_fiscal_period(fiscal_period: Optional[str]) -> Optional[str]:
+    """标准化可选上传财期。
+
+    Args:
+        fiscal_period: 原始财期。
+
+    Returns:
+        去除空白并转大写后的财期；空值返回 `None`。
+
+    Raises:
+        无。
+    """
+
+    normalized_period = str(fiscal_period or "").strip().upper()
+    if not normalized_period:
+        return None
+    return normalized_period
 
 
 def normalize_cn_fiscal_period(fiscal_period: str) -> str:

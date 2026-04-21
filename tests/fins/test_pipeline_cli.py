@@ -9,19 +9,19 @@ from typing import Any, AsyncIterator, Callable, Optional, cast
 
 import pytest
 
-from dayu.fins import cli
+from dayu.fins import cli_support as cli
 from dayu.log import Log, LogLevel
 from dayu.fins.domain.document_models import CompanyMeta
 from dayu.fins.downloaders.sec_downloader import RemoteFileDescriptor, SecDownloader
 from dayu.fins.ingestion.process_events import ProcessEvent, ProcessEventType
-from dayu.fins.pipelines import CnPipeline, SecPipeline, get_pipeline_from_market_profile
+from dayu.fins.pipelines import CnPipeline, SecPipeline, get_pipeline_from_normalized_ticker
 from dayu.fins.pipelines.base import PipelineProtocol
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent, UploadMaterialEventType
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.resolver.fmp_company_alias_resolver import FmpAliasInferenceResult
-from dayu.fins.resolver.market_resolver import MarketProfile, MarketResolver
+from dayu.fins.ticker_normalization import NormalizedTicker
 
 
 class FakePipeline(PipelineProtocol):
@@ -143,7 +143,7 @@ class FakePipeline(PipelineProtocol):
     def upload_filing(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -212,7 +212,7 @@ class FakePipeline(PipelineProtocol):
     async def upload_filing_stream(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -292,12 +292,14 @@ class FakePipeline(PipelineProtocol):
     def upload_material(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         form_type: str,
         material_name: str,
         files: Optional[list[Path]] = None,
         document_id: Optional[str] = None,
         internal_document_id: Optional[str] = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
         filing_date: Optional[str] = None,
         report_date: Optional[str] = None,
         company_id: Optional[str] = None,
@@ -337,6 +339,8 @@ class FakePipeline(PipelineProtocol):
             "files": [str(item) for item in files] if files else [],
             "document_id": document_id,
             "internal_document_id": internal_document_id,
+            "fiscal_year": fiscal_year,
+            "fiscal_period": fiscal_period,
             "filing_date": filing_date,
             "report_date": report_date,
             "company_id": company_id,
@@ -354,6 +358,8 @@ class FakePipeline(PipelineProtocol):
             "files": [str(item) for item in files] if files else [],
             "document_id": document_id,
             "internal_document_id": internal_document_id,
+            "fiscal_year": fiscal_year,
+            "fiscal_period": fiscal_period,
             "filing_date": filing_date,
             "report_date": report_date,
             "company_id": company_id,
@@ -365,12 +371,14 @@ class FakePipeline(PipelineProtocol):
     async def upload_material_stream(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         form_type: str,
         material_name: str,
         files: Optional[list[Path]] = None,
         document_id: Optional[str] = None,
         internal_document_id: Optional[str] = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
         filing_date: Optional[str] = None,
         report_date: Optional[str] = None,
         company_id: Optional[str] = None,
@@ -410,6 +418,8 @@ class FakePipeline(PipelineProtocol):
             "files": [str(item) for item in files] if files else [],
             "document_id": document_id,
             "internal_document_id": internal_document_id,
+            "fiscal_year": fiscal_year,
+            "fiscal_period": fiscal_period,
             "filing_date": filing_date,
             "report_date": report_date,
             "company_id": company_id,
@@ -438,6 +448,8 @@ class FakePipeline(PipelineProtocol):
                     "files": [str(item) for item in files] if files else [],
                     "document_id": document_id,
                     "internal_document_id": internal_document_id,
+                    "fiscal_year": fiscal_year,
+                    "fiscal_period": fiscal_period,
                     "filing_date": filing_date,
                     "report_date": report_date,
                     "company_id": company_id,
@@ -600,7 +612,7 @@ class FakePipelineWithUploadFileEvents(FakePipeline):
     async def upload_filing_stream(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         files: list[Path],
         fiscal_year: int,
         fiscal_period: str,
@@ -688,12 +700,14 @@ class FakePipelineWithUploadFileEvents(FakePipeline):
     async def upload_material_stream(
         self,
         ticker: str,
-        action: str,
+        action: str | None,
         form_type: str,
         material_name: str,
         files: Optional[list[Path]] = None,
         document_id: Optional[str] = None,
         internal_document_id: Optional[str] = None,
+        fiscal_year: int | None = None,
+        fiscal_period: str | None = None,
         filing_date: Optional[str] = None,
         report_date: Optional[str] = None,
         company_id: Optional[str] = None,
@@ -734,6 +748,8 @@ class FakePipelineWithUploadFileEvents(FakePipeline):
             "files": [str(item) for item in file_list],
             "document_id": document_id,
             "internal_document_id": internal_document_id,
+            "fiscal_year": fiscal_year,
+            "fiscal_period": fiscal_period,
             "filing_date": filing_date,
             "report_date": report_date,
             "company_id": company_id,
@@ -771,6 +787,8 @@ class FakePipelineWithUploadFileEvents(FakePipeline):
                     "files": [str(item) for item in file_list],
                     "document_id": document_id,
                     "internal_document_id": internal_document_id,
+                    "fiscal_year": fiscal_year,
+                    "fiscal_period": fiscal_period,
                     "filing_date": filing_date,
                     "report_date": report_date,
                     "company_id": company_id,
@@ -780,26 +798,6 @@ class FakePipelineWithUploadFileEvents(FakePipeline):
                 }
             },
         )
-
-
-class FakeResolver:
-    """用于测试 SecPipeline.download 的解析器桩。"""
-
-    @classmethod
-    def resolve(cls, ticker: str) -> MarketProfile:
-        """返回固定 US 市场画像。
-
-        Args:
-            ticker: 股票代码。
-
-        Returns:
-            US 市场画像。
-
-        Raises:
-            无。
-        """
-
-        return MarketProfile(ticker=ticker, market="US")
 
 
 class DummyDownloader:
@@ -1091,9 +1089,9 @@ def test_factory_returns_sec_pipeline_for_us_market(tmp_path: Path) -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    profile = MarketProfile(ticker="AAPL", market="US")
-    pipeline = get_pipeline_from_market_profile(
-        market_profile=profile,
+    normalized = NormalizedTicker(canonical="AAPL", market="US", exchange=None, raw="AAPL")
+    pipeline = get_pipeline_from_normalized_ticker(
+        normalized_ticker=normalized,
         workspace_root=tmp_path,
     )
     assert isinstance(pipeline, SecPipeline)
@@ -1112,9 +1110,9 @@ def test_factory_returns_cn_pipeline_for_cn_market(tmp_path: Path) -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    profile = MarketProfile(ticker="000333", market="CN")
-    pipeline = get_pipeline_from_market_profile(
-        market_profile=profile,
+    normalized = NormalizedTicker(canonical="000333", market="CN", exchange="SZSE", raw="000333")
+    pipeline = get_pipeline_from_normalized_ticker(
+        normalized_ticker=normalized,
         workspace_root=tmp_path,
     )
     assert isinstance(pipeline, CnPipeline)
@@ -1133,12 +1131,12 @@ def test_factory_raises_for_unsupported_market(tmp_path: Path) -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    profile = MarketProfile(ticker="ABC", market="US")
+    normalized = NormalizedTicker(canonical="ABC", market="US", exchange=None, raw="ABC")
     # 通过动态赋值模拟异常市场，验证工厂兜底分支。
-    object.__setattr__(profile, "market", "JP")
+    object.__setattr__(normalized, "market", "JP")
     with pytest.raises(ValueError, match="不支持的 market"):
-        get_pipeline_from_market_profile(
-            market_profile=profile,
+        get_pipeline_from_normalized_ticker(
+            normalized_ticker=normalized,
             workspace_root=tmp_path,
         )
 
@@ -1159,7 +1157,6 @@ def test_sec_pipeline_download_calls_sec_downloader(tmp_path: Path) -> None:
     dummy_downloader = DummyDownloader()
     pipeline = SecPipeline(
         workspace_root=tmp_path,
-        resolver_cls=cast(type[MarketResolver], FakeResolver),
         downloader=cast(SecDownloader, dummy_downloader),
         processor_registry=build_fins_processor_registry(),
     )
@@ -1388,7 +1385,7 @@ def test_dispatch_upload_filing_uses_default_action_create(tmp_path: Path) -> No
     assert result["fiscal_period"] == "FY"
     assert fake.last_call is not None
     assert fake.last_call[0] == "upload_filing"
-    assert fake.last_call[1]["action"] == "create"
+    assert fake.last_call[1]["action"] is None
     assert fake.last_call[1]["company_id"] == "320193"
     assert fake.last_call[1]["company_name"] == "Apple Inc."
 
@@ -1442,7 +1439,8 @@ def test_dispatch_download_passes_csv_aliases_to_pipeline() -> None:
     assert result["ticker"] == "BABA"
     assert fake.last_call is not None
     assert fake.last_call[1]["ticker"] == "BABA"
-    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "9988.HK"]
+    # CSV 每个 token 都归一化后去重：`9988.HK` canonical=`9988` 与前者重复，被去掉。
+    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988"]
 
 
 def test_dispatch_download_infer_merges_explicit_and_fmp_aliases(
@@ -1473,7 +1471,8 @@ def test_dispatch_download_infer_merges_explicit_and_fmp_aliases(
     cli._dispatch_action(fake, args)
 
     assert fake.last_call is not None
-    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "9988.HK", "BABAF"]
+    # CSV token 与 FMP alias 都归一化后整体去重：`9988.HK`→`9988`，`BABAF` 不是合法 ticker 回退大写。
+    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "BABAF"]
 
 
 def test_dispatch_download_infer_failure_falls_back_to_explicit_aliases(
@@ -1500,7 +1499,7 @@ def test_dispatch_download_infer_failure_falls_back_to_explicit_aliases(
     cli._dispatch_action(fake, args)
 
     assert fake.last_call is not None
-    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "9988.HK"]
+    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988"]
 
 
 def test_dispatch_upload_filing_create_requires_company_meta_when_meta_missing(
@@ -1587,7 +1586,7 @@ def test_dispatch_upload_filing_infer_merges_aliases_and_preserves_explicit_comp
     assert result["ticker"] == "BABA"
     assert result["company_name"] == "阿里巴巴"
     assert fake.last_call is not None
-    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "BABAF", "9988.HK"]
+    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "BABAF"]
     assert fake.last_call[1]["company_name"] == "阿里巴巴"
 
 
@@ -1633,7 +1632,7 @@ def test_dispatch_upload_filing_infer_fills_missing_company_name_and_merges_alia
 
     assert result["company_name"] == "Alibaba Group Holding Limited"
     assert fake.last_call is not None
-    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "BABAF", "9988.HK"]
+    assert fake.last_call[1]["ticker_aliases"] == ["BABA", "9988", "BABAF"]
     assert fake.last_call[1]["company_name"] == "Alibaba Group Holding Limited"
 
 
@@ -1725,14 +1724,15 @@ def test_dispatch_upload_filings_from_generates_script(
     assert result["skipped_count"] == 1
     assert output_script.exists()
     script_text = output_script.read_text(encoding="utf-8")
-    command_lines = [line for line in script_text.splitlines() if line.startswith("dayu-cli upload_")]
+    command_lines = [line for line in script_text.splitlines() if line.startswith("python -m dayu.cli upload_")]
     assert "--fiscal-year 2025 --fiscal-period Q1" in script_text
     assert "--fiscal-year 2023 --fiscal-period FY" in script_text
     assert "--fiscal-year 2025 --fiscal-period H1" in script_text
-    assert "--action create" in script_text
+    assert "--action create" not in script_text
     assert "\n".join(command_lines).count("--company-id 000333") == 1
     assert "\n".join(command_lines).count("--company-name") == 1
-    assert "# dayu-cli upload_filings_from" in script_text
+    assert all(line.endswith('"$@"') for line in command_lines)
+    assert "# python -m dayu.cli upload_filings_from" in script_text
 
 
 def test_dispatch_upload_filings_from_output_directory_writes_default_script_name(
@@ -1783,7 +1783,7 @@ def test_dispatch_upload_filings_from_output_directory_writes_default_script_nam
     assert result["script_path"] == str(expected_script.resolve())
     assert expected_script.exists()
     script_text = expected_script.read_text(encoding="utf-8")
-    command_lines = [line for line in script_text.splitlines() if line.startswith("dayu-cli upload_")]
+    command_lines = [line for line in script_text.splitlines() if line.startswith("python -m dayu.cli upload_")]
     assert "--ticker 0300" in script_text
     assert "\n".join(command_lines).count("--company-id 0300") == 1
     assert "\n".join(command_lines).count("--company-name") == 1
@@ -1865,7 +1865,7 @@ def test_dispatch_upload_filings_from_windows_output_directory_writes_cmd_script
     assert expected_script.exists()
     script_text = expected_script.read_text(encoding="utf-8")
     assert script_text.startswith("@echo off")
-    assert "REM dayu-cli upload_filings_from" in script_text
+    assert "REM python -m dayu.cli upload_filings_from" in script_text
 
 
 def test_dispatch_upload_filings_from_requires_company_meta(tmp_path: Path) -> None:
@@ -1947,12 +1947,12 @@ def test_dispatch_upload_filings_from_infer_bakes_result_into_generated_commands
     result = cli._dispatch_action(FakePipeline(), args)
 
     assert infer_calls == ["BABA"]
-    assert result["generated_ticker_csv"] == "BABA,9988,9988.HK,89988.HK"
+    assert result["generated_ticker_csv"] == "BABA,9988,89988"
     script_text = output_script.read_text(encoding="utf-8")
-    assert "# dayu-cli upload_filings_from --ticker BABA,9988" in script_text
+    assert "# python -m dayu.cli upload_filings_from --ticker BABA,9988" in script_text
     assert "--infer" in script_text
     assert "upload_filing" in script_text
-    assert "--ticker BABA,9988,9988.HK,89988.HK" in script_text
+    assert "--ticker BABA,9988,89988" in script_text
     assert "--company-name '阿里巴巴'" in script_text
     assert script_text.count("--infer") == 1
 
@@ -2444,18 +2444,8 @@ def test_validate_upload_material_normalizes_form_type_to_upper(tmp_path: Path) 
     assert args.form_type == "EARNINGS_CALL"
 
 
-def test_dispatch_upload_material_validates_update_requires_document_id(tmp_path: Path) -> None:
-    """验证 `upload_material` 的 update 参数校验。
-
-    Args:
-        tmp_path: 临时目录。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 断言失败时抛出。
-    """
+def test_dispatch_upload_material_allows_update_without_explicit_document_id(tmp_path: Path) -> None:
+    """验证 `upload_material update` 可仅凭稳定规则定位目标文档。"""
 
     file_path = tmp_path / "material.pdf"
     file_path.write_text("content", encoding="utf-8")
@@ -2479,8 +2469,45 @@ def test_dispatch_upload_material_validates_update_requires_document_id(tmp_path
             "Apple Inc.",
         ]
     )
-    with pytest.raises(ValueError, match="document-id"):
-        cli._dispatch_action(FakePipeline(), args)
+    result = cli._dispatch_action(FakePipeline(), args)
+    assert result["action"] == "upload_material"
+    assert result["material_action"] == "update"
+
+
+def test_dispatch_upload_material_passes_optional_fiscal_fields(tmp_path: Path) -> None:
+    """验证 `upload_material` 会把可选 fiscal 字段传给 pipeline。"""
+
+    file_path = tmp_path / "material.pdf"
+    file_path.write_text("content", encoding="utf-8")
+    parser = cli._create_parser()
+    args = parser.parse_args(
+        [
+            "upload_material",
+            "--ticker",
+            "MSFT",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Deck",
+            "--files",
+            str(file_path),
+            "--fiscal-year",
+            "2025",
+            "--fiscal-period",
+            "q1",
+            "--company-id",
+            "320193",
+            "--company-name",
+            "Apple Inc.",
+        ]
+    )
+    fake = FakePipeline()
+    cli._dispatch_action(fake, args)
+    assert fake.last_call is not None
+    assert fake.last_call[0] == "upload_material"
+    assert fake.last_call[1]["action"] is None
+    assert fake.last_call[1]["fiscal_year"] == 2025
+    assert fake.last_call[1]["fiscal_period"] == "Q1"
 
 
 def test_dispatch_upload_material_create_requires_company_meta_when_meta_missing(

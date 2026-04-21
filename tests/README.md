@@ -36,6 +36,7 @@
 
 另外：
 - `tests/fixtures/` 放测试数据
+- `tests/` 根目录下的少量 `test_*.py` 用于承接项目级工具脚本与通用辅助模块的轻量回归；这类测试应优先守住稳定输入输出边界，不把临时脚本细节固化进测试
 - `tests/engine/test_docling_processor_integration.py`、`tests/fins/test_docling_upload_service_integration.py`、`tests/engine/test_web_fetch_docling_integration.py` 是问题 2 第一批真实集成测试，必须直接走真实 Docling 执行链，不允许通过 monkeypatch `DocumentConverter` 或 fake `DoclingDocument` 伪造通过
 - 仓库根 `tests/` 明确作为本地测试包维护，避免干净虚拟环境里第三方同名 `tests` 包抢占导入解析，导致 `pyright` 或测试辅助模块引用漂移到 `site-packages`
 
@@ -81,8 +82,8 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - 必须使用固定 fixture
 - 必须走真实第三方执行链
 - 表格退化不可接受，不能只断言“返回非空字符串”
-- 当前 Dayu 为避免 Apple Silicon 上 Docling 自动选择 MPS 触发 OOM，默认在 macOS 上把 PDF 转换固定到 CPU；若需要显式验证其他设备，可通过环境变量 `DAYU_DOCLING_DEVICE=auto|cpu|cuda|mps|xpu` 覆盖
-- 与此对应，unit test 若只想隔离 Docling 转换结果，应 patch `build_docling_pdf_converter()` 这类项目内真源 seam，不要继续直接 patch 第三方 `DocumentConverter` 类
+- 当前 Dayu 已将 upload / web tool 等 Docling PDF 转换入口统一收口到 `dayu.docling_runtime`；默认设备为 `auto`，若 `auto` 转换阶段失败则统一回退到 `cpu` 重试一次；若需要显式验证其他设备，可通过环境变量 `DAYU_DOCLING_DEVICE=auto|cpu|cuda|mps|xpu` 覆盖
+- 与此对应，unit test 若只想隔离 Docling 转换结果，应优先 patch `run_docling_pdf_conversion()` 这类项目内真源 seam；若只测装配参数，再 patch `build_docling_pdf_converter()`，不要继续直接 patch 第三方 `DocumentConverter` 类
 
 ### 3.2 Service / Host / Agent 路径守护
 
@@ -138,6 +139,7 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `test_scene_execution.py` 还要守住内部 `RunnerType` / `FallbackMode` 可提升为枚举承接，但配置快照和 JSON 边界仍保持原字符串值，不要把外部输入边界改造成枚举字面量协议。
 - execution 运行配置的测试真源现在拆成两层：`dayu.execution.options` 负责合并规则，`dayu.execution.runtime_config` 负责纯运行配置模型与快照转换。凡是直接构造 `ResolvedExecutionOptions` 的测试，应优先使用 `AgentRuntimeConfig`、`OpenAIRunnerRuntimeConfig`、`CliRunnerRuntimeConfig` 这组 execution 侧纯模型，不要再把 engine 实现类直接塞回 execution 层对象。
 - `test_host_executor.py`、`test_run_registry.py`、`test_host_admin_service.py` 与 `test_web_routes.py` 需要共同守住 Host timeout 取消链路。`request_cancel()` 只记录 `cancel_requested_at` / `cancel_requested_reason`，终态 `cancel_reason` 必须等 Host 在 run 生命周期边界统一收敛后才写入；管理视图与 API 需要同时透出这两层信息。
+- `test_host_executor.py` 与 `test_run_registry.py` 还要继续守住 orphan run 修复语义：startup cleanup 只能清理超过 grace period 的 dead-pid 活跃 run，不能误伤刚启动或仍在收尾的前台 direct operation；若同一 owner 的 run 被外部误判成 `orphan: owner process terminated`，后续成功收口必须允许修复回 `SUCCEEDED`，而异常路径也不能再被重复 `fail_run()` 掩盖成状态机错误。
 - `test_host_executor.py` 还要守住 transcript 落库闸门：即使 Agent 本轮已经产出 `final_answer`，只要 run 在 transcript 持久化前被取消，`persist_turn()` 也必须跳过，不能把“已取消”run 的回答写进会话真源。
 - `test_host_executor.py` 还要守住 `run_agent_and_wait()` 的同步聚合路径直接比较 `AppEventType`，不能退回依赖 `final_answer` / `warning` / `error` 这类字符串 value，否则应用层事件枚举改值时会出现静默失配。
 - `test_host_executor.py`、`test_cli_running_config.py`、`test_reply_outbox_web_integration.py`、`test_wechat_daemon.py` 与 `test_write_pipeline.py` 还要共同守住取消消费语义：`Host.run_agent_and_wait()` 遇到 `AppEventType.CANCELLED` 必须抛出 `CancelledError`，不能伪装成空 `AppResult`；CLI 写作模式应返回显式取消退出码，Web reply outbox 不得提交取消前的 partial reply，WeChat 不得发送空兜底或残留 partial 内容，write pipeline 也不得对取消做重试或降级继续。
@@ -191,7 +193,7 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `tests/application/conftest.py` 这类共享夹具文件必须直接跟随 `HostExecutorProtocol` / `SessionRegistryProtocol` 演进；像 `StubHostExecutor.run_operation_stream/run_operation_sync` 这类泛型返回签名、以及 `StubSessionRegistry.close_idle_sessions()` 这类新协议方法，应优先在共享夹具真源补齐，而不是在每个下游测试里重复 `cast` 或 `type: ignore`。
 - 项目级 `tests/conftest.py` 这类 import 兼容夹具若需要预加载模块，也要先显式断言 `ModuleSpec/loader` 非空，再在 `ModuleType` 边界集中 `cast(Any, module)` 后补动态别名；不要把 `spec.loader` 的可空分支或动态属性赋值散落到正文。
 - `test_cli_interactive_coverage.py` 这类 CLI UI 测试里的 fake session 应直接实现 `ChatServiceProtocol` / `PromptServiceProtocol` 公开方法（如 `submit_turn`、`resume_pending_turn`、`list_resumable_pending_turns`、`submit`），不要继续只靠旧的 `stream/stream_turn` 形态再由测试把对象硬塞进 `interactive_ui`。
-- `test_sse_parser.py` 与 `test_sec_pipeline_download.py` 这类 Engine/Fins 装配测试，遇到 `ClientResponse`、`AsyncOpenAIRunnerRunningConfig`、`SecDownloader`、`MarketResolver` 等生产签名时，优先在测试装配边界用 helper 做一次显式类型收窄；不要为了消除 pyright 报错去让测试 stub 继承不匹配的生产实现类，尤其不要把同步 stub 硬继承到异步 downloader 真源上。
+- `test_sse_parser.py` 与 `test_sec_pipeline_download.py` 这类 Engine/Fins 装配测试，遇到 `ClientResponse`、`AsyncOpenAIRunnerRunningConfig`、`SecDownloader` 等生产签名时，优先在测试装配边界用 helper 做一次显式类型收窄；不要为了消除 pyright 报错去让测试 stub 继承不匹配的生产实现类，尤其不要把同步 stub 硬继承到异步 downloader 真源上。ticker 市场识别一律对齐 `dayu.fins.ticker_normalization.normalize_ticker` 真源，需要 stub 时在消费者模块路径上 `monkeypatch.setattr(module, "normalize_ticker", ...)` 返回自造 `NormalizedTicker`，不要重造识别类。
 - Engine 内部测试如果必须直接构造 `AgentRunningConfig` 或 `AsyncOpenAIRunnerRunningConfig`，应从各自定义模块导入，不要再依赖 `dayu.engine` 的聚合导出面；跨层 runtime config 真源仍以 `dayu.execution.runtime_config` 为准。
 - `tests/fins/test_bs_report_form_common.py` 这类 processor 单测里，`Source` dummy 应保持普通类做结构兼容；`XBRL`、`_TableBlock` 等实现类型应在测试装配边界集中 `cast` / helper 收窄，不要把 `SimpleNamespace` 直接写进处理器字段或方法签名。
 - `tests/engine/test_bs_processor.py` 这类基础 processor 搜索测试里，`SearchHit.section_ref/snippet` 等非必填字段也应通过 helper 安全读取；不要在基础回归里裸下标访问，否则很容易和 `search_utils` 一类文件重复产生同源 TypedDict 错误。
@@ -199,7 +201,7 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `tests/engine/test_html_processing_pipeline.py` 这类 HTML 管线测试若通过 `ModuleType` 注入假的 `trafilatura/readability/html2text` 模块，应像 FastAPI 组合根测试一样在模块边界集中 `cast(Any, module)` 后再挂 `extract/Document/HTML2Text`，不要直接对 `ModuleType` 动态赋属性。
 - `tests/engine/test_docling_processor_helpers.py` 这类 Docling helper 测试里的 source 桩，应直接补齐 `Source` 协议要求的 `uri/media_type/content_length/etag/open/materialize` 最小集合；不要为了只测 `_sniff_docling_json()` 就继续传半截 source 对象。
 - `tests/engine/test_markdown_processor_coverage_supplement.py` 这类 Markdown 搜索覆盖测试里，`SearchHit.section_title` 等可选字段也应通过 helper / `.get()` 安全读取，不要把搜索结果里的可选键当成必填键直接下标访问。
-- `tests/fins/test_sec_pipeline_process_filing_source.py` 这类 pipeline + processor registry 测试里的 fake resolver / fake processor，应直接对齐 `MarketResolver` / `DocumentProcessor` 稳定协议；只有故意验证“缺失 parser version”这类负例时，才允许在 `registry.register(...)` 边界做一次显式 `cast(type[DocumentProcessor], ...)`。
+- `tests/fins/test_sec_pipeline_process_filing_source.py` 这类 pipeline + processor registry 测试里的 fake processor 应直接对齐 `DocumentProcessor` 稳定协议；只有故意验证“缺失 parser version”这类负例时，才允许在 `registry.register(...)` 边界做一次显式 `cast(type[DocumentProcessor], ...)`。市场识别一律通过 `normalize_ticker` 真源，在消费者模块路径上 monkeypatch 返回自造 `NormalizedTicker`，不要再引入 fake resolver 类。
 - `tests/engine/test_processor_registry.py` 这类 registry 单测里的 dummy processor，也要补齐 `DocumentProcessor` 公共基元（`get_parser_version`、`list_sections`、`list_tables`、`read_section`、`read_table`、`get_section_title`、`search`、全文接口）；不要再用只实现 `supports/__init__` 的半截 fake 去注册。
 - `tests/engine/test_processor_registry_builder.py` 这类 registry builder 测试里，若 `list_processors()` 返回的是 `dict[str, object]` 视图，就在断言边界单次 `cast` 后再做 `int(...)` 之类窄化；不要把 `object` 直接传给数值转换函数。
 - `tests/engine/test_tools_base.py` 这类 tools/base 负例测试里，若故意给 `build_tool_schema()` 或 `@tool(..., truncate=...)` 传错误类型，只在该负例调用边界单次 `cast(Any, ...)`；不要让非法参数的弱类型输入污染其它测试分支。
@@ -227,9 +229,9 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `tests/engine/test_cancellation.py` 这类并发/取消原语测试里，不要依赖 `threading.atomic` 这类不存在或不可移植的 API；计数或同步需求统一用 `Lock + list/int` 这类标准库可移植原语表达。
 - `tests/engine/test_docling_processor.py` 这类 processor 返回值测试里，`SectionSummary` / `TableContent` / `SearchHit` 的可选字段应通过 `.get()` 或 helper 读取；只有故意制造非法 `page_range` 之类负例时，才允许在测试边界对内部 block 做一次显式 `cast(Any, ...)` 注入异常值。
 - `tests/engine/test_tool_registry_v2.py` 这类 ToolRegistry 边界测试里，给工具函数挂 `__tool_extra__` 这类动态属性时，应集中通过 helper 在测试边界做一次 `cast(Any, func)`；若故意验证 `execute()` 的非法 arguments 分支，也只在该负例调用点做单次收窄，不要把错误类型输入扩散到其它测试夹具。
-- `tests/fins/test_sec_pipeline_process.py` 这类 pipeline 离线导出测试里，fake resolver 应直接继承 `MarketResolver`；测试仓储 core 上的 `portfolio_root` / `create_filing()` 访问则通过 helper 在边界集中收窄，不要在 helper 签名里继续裸用 `object` 后直接点属性。
+- `tests/fins/test_sec_pipeline_process.py` 这类 pipeline 离线导出测试应通过 `monkeypatch.setattr(workflow_module, "normalize_ticker", ...)` 在消费者模块路径上替换市场识别真源；测试仓储 core 上的 `portfolio_root` / `create_filing()` 访问则通过 helper 在边界集中收窄，不要在 helper 签名里继续裸用 `object` 后直接点属性。
 - `tests/fins/test_cn_pipeline_helpers.py` 这类 CN pipeline helper 测试同样应把 `build_storage_core()` 返回值先收窄到最小仓储协议，再访问 `portfolio_root/create_filing/create_material`；不要在 helper 签名里继续保留 `object` 后直接点属性。
-- `tests/fins/test_sec_pipeline_process_material.py` 这类 material 处理测试也应复用同一原则：fake resolver 直接继承 `MarketResolver`，fake processor 直接补齐 `DocumentProcessor` 的全文/章节/表格稳定接口，测试仓储则通过最小协议 helper 收窄 `portfolio_root` / `create_material()`，不要把 `build_storage_core()` 返回值继续当成 `object` 使用。
+- `tests/fins/test_sec_pipeline_process_material.py` 这类 material 处理测试也应复用同一原则：市场识别统一对齐 `normalize_ticker` 真源（在 workflow 模块路径上 monkeypatch），fake processor 直接补齐 `DocumentProcessor` 的全文/章节/表格稳定接口，测试仓储则通过最小协议 helper 收窄 `portfolio_root` / `create_material()`，不要把 `build_storage_core()` 返回值继续当成 `object` 使用。
 - `tests/fins/test_cn_pipeline_process.py` 这类 CN pipeline 离线处理测试里的 fake processor，也应像 SEC 对应测试一样直接补齐 `DocumentProcessor` 的章节/表格/搜索/全文稳定接口；源文档仓储访问则继续通过最小协议 helper 收窄，避免 `processor_cls` 和 `repository` 两头同时漂移。
 - `tests/fins/test_bs_def14a_processor.py` 这类专项 processor 单测里，marker 列表应显式按 `list[tuple[int, str | None]]` 构造；`Source` dummy 也要补齐 `content_length/etag` 等稳定字段，避免为了偷懒用半截 source 桩反复触发协议不匹配。
 - `tests/fins/test_tool_snapshot_export_helpers.py` 这类 tool snapshot helper 测试里，company/blob 仓储桩应直接补齐 `CompanyMetaRepositoryProtocol` / `DocumentBlobRepositoryProtocol` 的稳定方法与签名；只有故意喂非法 `financial_statement_calls` 或 concrete service 参数时，才在单个负例调用边界做一次 `cast`，不要把半截仓储桩散落到多个 helper 断言里。
@@ -247,8 +249,8 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `tests/fins/test_sec_report_form_processors_coverage.py` 这类专项处理器覆盖测试里，`processor_cls` 参数应显式收窄到真实报告处理器类联合，而不是 `Type[object]`；传给 `_has_minimum_twenty_f_item_quality()` 的标题列表也应按 `list[str | None]` 构造，避免在 20-F 质量门禁测试里反复触发 list 不变性报错。
 - `tests/fins/test_processor_registry_builder.py` 这类 fins registry builder 测试，也应沿用 engine 对应文件的同一规则：`list_processors()` 返回的 `priority` 若仍是 `object` 视图，就在断言边界单次 `cast` 后再做数值比较。
 - `tests/fins/test_sec_6k_rule_diagnostics.py` 这类诊断脚本测试里，若 `kwargs` 被故意声明成宽 `object` 以覆盖入口边界，真正消费 `tickers/document_ids` 这类字段时应在该读取点单次收窄，不要直接把 `object` 传给 `list(...)` 或其它 iterable API。
-- `tests/fins/test_sec_pipeline_http_cache.py` 与 `tests/fins/test_sec_pipeline_rejection_registry.py` 这类 `SecPipeline` 测试里的 fake resolver，应直接继承 `MarketResolver`，不要只实现同名 `resolve()` 后把裸类对象传给 `resolver_cls`。
-- `tests/fins/test_sec_pipeline_download_stream.py` 这类下载流测试同样要沿用真实构造边界：fake resolver 直接继承 `MarketResolver`，fake downloader 直接继承 `SecDownloader` 并对齐 `download_files_stream()` 的 `store_file` 签名；不要把“长得像下载器”的普通类直接塞进 `SecPipeline(...)`。
+- `tests/fins/test_sec_pipeline_http_cache.py` 与 `tests/fins/test_sec_pipeline_rejection_registry.py` 这类 `SecPipeline` 测试里的市场识别，应通过 monkeypatch 在消费者 workflow 模块路径上替换 `normalize_ticker`，不要再引入 fake resolver 类，也不要向 `SecPipeline(...)` 构造器传入任何识别器注入参数。
+- `tests/fins/test_sec_pipeline_download_stream.py` 这类下载流测试同样要沿用真实构造边界：市场识别对齐 `normalize_ticker` 真源（在 workflow 模块路径上 monkeypatch），fake downloader 直接继承 `SecDownloader` 并对齐 `download_files_stream()` 的 `store_file` 签名；不要把“长得像下载器”的普通类直接塞进 `SecPipeline(...)`。
 - `tests/fins/test_section_semantic.py` 这类 section semantic 测试里，`resolve_section_semantic()` 返回的标题是 `str | None`，在做子串断言前要先显式断言非空，不要直接对可空字符串做 `in` 判断。
 - `tests/application/test_execution_runtime_config.py` 这类运行配置快照测试里，`build_runner_running_config_from_snapshot()` 的返回值在断言 OpenAI 字段前要先显式收窄到 `OpenAIRunnerRuntimeConfig`；构造 `AgentRuntimeConfig` 时也应直接使用 `FallbackMode` 枚举，而不是再传裸字符串。
 - `tests/application/test_cancellation_bridge.py` 这类 Host polling 测试里的 mock run registry，如果只实现了 `get_run()` 这一条被测路径，可在 `CancellationBridge` 构造边界单次 `cast(RunRegistryProtocol, ...)`；不要为消除 pyright 报错把整套 `RunRegistryProtocol` 在测试里机械复刻一遍。

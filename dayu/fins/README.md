@@ -46,6 +46,11 @@ UI
 - `process_filing`
 - `process_material`
 
+当前上传链路还固定遵守三条实现边界：
+- `upload_filing` 的 `document_id` 继续由财年/财期规则稳定生成，不跟文件内容绑定。
+- `upload_material` 的 `document_id` 由 `form_type + material_name + fiscal_year? + fiscal_period?` 稳定生成；当前 material 场景下 `document_id` 与 `internal_document_id` 恒等，显式传入时也只能与这套规则一致，不能覆盖它。
+- `upload_filing` / `upload_material` 未显式传 `action` 时统一按 source meta 自动解析 `create/update`；删除动作必须显式传入 `delete`。相同原始上传文件指纹会在 Docling convert 前直接 `skip`；`overwrite` 只重置当前 `document_id`，不会做 ticker 级清空。
+
 ## 2. 设计意图
 
 ### 2.1 为什么文档读取统一经过 FinsToolService
@@ -191,7 +196,7 @@ direct operation 当前由 `FinsRuntime` 和对应 pipeline 实现。
 - `dayu/fins/pipelines/sec_sc13_filtering.py` — SC13 的方向过滤、browse-edgar 补拉、空结果回溯重试与同 filer 去重
 - `dayu/fins/pipelines/sec_rebuild_workflow.py` — rebuild 模式的本地过滤条件、单 filing canonical meta 重建与 replace-source-meta 覆盖
 - `dayu/fins/pipelines/sec_process_workflow.py` — process/process_filing/process_material 的单文档决策与批量工作流编排
-- `dayu/fins/pipelines/sec_upload_workflow.py` — upload_filing/upload_material 的事件编排与结果收口
+- `dayu/fins/pipelines/sec_upload_workflow.py` — upload_filing/upload_material 的事件编排、稳定上传身份、自动动作解析与单文档 overwrite reset 收口
 
 当前 source fiscal 字段还需要守住一条稳定边界：source/download/rebuild/list 四条链路都不能仅凭 `report_date` 或 `filing_date` 编造 fiscal 事实。`6-K` 与 `6-K/A` 在没有同源 fiscal 证据时都不得再猜 `fiscal_year/fiscal_period`；`10-Q` 也不得在 `list_documents()` 阶段仅凭 `report_date` 推断季度；其他表单同样不得在消费侧把空的 `fiscal_year` 从日期回填出来。当前仅保留表单内生、且不依赖日期猜测的低风险回退，例如 `10-K/20-F -> FY`。`download --rebuild` 走同一套真源，并且会清理历史上遗留在 source meta / manifest 中的 6-K / 6-K/A 猜测值。这个修复只影响 fiscal 字段，不改变 6-K 现有的 `document_type` 返回语义。
 
@@ -434,7 +439,24 @@ python utils/retriage_active_6k_filings.py --base workspace --tickers ALC,ASM,NV
 
 其中第 2 到第 5 步都必须把 `_classify_6k_text()` 当作唯一真源；主文件诊断也只是把同 filing 下各候选 exhibit 重新交给同一真源分类，再报告“当前主文件是否被别的季度 exhibit 支配”，不会额外复制另一套规则。
 
-## 6. 内部分层
+## 6. Ticker 归一化真源
+
+所有 ticker 的归一化都统一收敛到 `dayu/fins/ticker_normalization.py`：
+
+- 公共 API：`normalize_ticker(raw) -> NormalizedTicker`（非法抛 `ValueError`）、`try_normalize_ticker(raw) -> Optional[NormalizedTicker]`（非法返回 `None`）、`ticker_to_company_id(ticker) -> str`。
+- `NormalizedTicker` 包含 `canonical`、`market`、`exchange`、`raw` 四个字段。
+- Canonical 约定：
+  - 港股 4 位补零（`0700`）；港交所新发 5 位代码原样保留（`89988`）；`exchange="HKEX"`、`market="HK"`。
+  - 沪股 6 位裸码，首位 `6`（主板 / 科创板）；`exchange="SSE"`、`market="CN"`。
+  - 深股 6 位裸码，首位 `0` / `3`（主板 / 创业板）；`exchange="SZSE"`、`market="CN"`。
+  - 美股保留原字母（`AAPL` / `BRK.B` / `BF.B`）；`exchange=None`、`market="US"`（当前不区分 NYSE/NASDAQ）。
+- 使用规则：
+  - CLI / service / 仓储 / downloader / pipeline / prompt contribution 一律调用该真源，不再在各自模块重造 normalize 实现。
+  - `FinsToolService._resolve_canonical_ticker` 中真源识别失败时会回退到 `strip().upper()` 作为查询候选，保留"公司名当 ticker 传"的既有行为。
+  - CLI `--ticker` CSV 中**每个 token 都走真源归一化**，再整体去重：首个归一化结果作为 canonical，其余作为显式 alias。业务动机是把同一公司的跨市场 ticker（如 `BABA,9988`）整体作为 alias 写入 meta，让工具查询无论传哪种变形都能命中。
+- `ticker_to_company_id` 当前直接返回 `ticker.canonical`，属"稳定契约、实现可演进"：保留该接口以便后续接入跨市场上市折叠、CIK、统一社会信用代码等更精细的公司主体映射。
+
+## 7. 内部分层
 
 当前更合理的内部理解方式是五层：
 
@@ -515,7 +537,7 @@ python utils/retriage_active_6k_filings.py --base workspace --tickers ALC,ASM,NV
 - `blob` 仓储只负责文件枚举、字节读写与文件对象落盘；凡是需要返回 `Source` 或物化本地路径的流程，必须走 `SourceDocumentRepositoryProtocol`，不能在 blob 仓储协议上临时补 source 能力。
 - Docling 上传链路若需要访问第三方 stub 未声明但运行时存在的字段，必须把适配逻辑收口在 pipeline 单点 helper，不要把第三方具体字段要求向 Tool Service、Processor 或上层调用方扩散。
 
-## 7. 代码阅读顺序
+## 8. 代码阅读顺序
 
 推荐从这里进入：
 
