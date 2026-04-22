@@ -354,6 +354,25 @@ sequenceDiagram
 - 决定 prompt contributions
 - 创建 Session 或 Run
 
+### 3.8 workspace migrations
+
+`workspace migrations` 是 `dayu-cli init` 在启动期针对**旧工作区**执行的一次性修复脚本集合，集中在 `dayu/cli/workspace_migrations/`。它与 §3.5 `startup preparation` 并列——都只服务于启动期、不进入请求期调用链——但职责是一次性的"把旧工作区就地升级到当前 schema"，而不是"为本次运行准备依赖"。
+
+它负责：
+
+- 向后扫描 `workspace/config/run.json`，在缺少新 schema 要求的 key 时补齐默认值，已有取值一律保留
+- 向后扫描 `.dayu/host/dayu_host.db` 中的 `pending_conversation_turns.resume_source_json`，按当前 schema 原地改名旧 JSON key
+- 每条规则一个模块、一个幂等函数，通过 `apply_all_workspace_migrations` 统一调度
+- 只在规则实际生效时打印一行，供用户感知
+
+它不负责：
+
+- 维护数据库 schema 本身（`CREATE TABLE` 仍在 `dayu.host.host_store`）
+- 保留旧 schema 的兼容读取路径——规则按 CLAUDE.md "全新 schema 起库"约束，**只向前迁移**
+- 进入请求期——`dayu-cli` 任何非 `init` 命令都不会触发该目录
+
+扩展约束：新增一次性迁移时，只在 `dayu/cli/workspace_migrations/` 下新增模块 + 登记到 runner，禁止把规则写回 `dayu/cli/commands/init.py`。
+
 ## 4. 核心契约
 
 Dayu 在 Agent 路径上稳定使用五类数据契约：
@@ -607,7 +626,7 @@ class AcceptedInfrastructureSpec:
 @dataclass(frozen=True)
 class ExecutionHostPolicy:
     session_key: str | None = None
-    concurrency_lane: str | None = None
+    business_concurrency_lane: str | None = None
     timeout_ms: int | None = None
     resumable: bool = False
 
@@ -862,9 +881,11 @@ Host 是 Dayu 的通用托管执行层。它的价值不在于“帮 Service 调
 
 实现机制：
 
-- `Service` 只在 `ExecutionHostPolicy.concurrency_lane` 里声明这次执行要进入哪个 lane。
-- `DefaultHostExecutor` 在 run 启动时根据 lane 向 `ConcurrencyGovernor` 申请 permit，结束时统一释放。
-- lane 配置属于 Host 启动期依赖，不由 UI 或 Service 在请求期临时拼装。
+- `Service` 只在 `ExecutionHostPolicy.business_concurrency_lane`（以及 `HostedRunSpec.business_concurrency_lane`）里声明这次执行要占用的**业务** lane，例如 `write_chapter`、`sec_download`。
+- Host 自治 lane `llm_api` 由 `DefaultHostExecutor` 根据调用路径自动叠加（`run_agent_stream` / `run_prepared_turn_stream` 路径必叠加；`run_operation_*` 路径不叠加），Service 代码不出现 `"llm_api"` 字面量、也不参与是否加 llm_api 的业务判断。
+- 同一次 run 可能同时持有多条 lane 的 permit：`DefaultHostExecutor` 在 run 启动时把全部必需 lane 按字母序传给 `ConcurrencyGovernorProtocol.acquire_many`，由 governor 在**单个持久化事务**内完成"全部 lane 额度检查 + 全部 permit 写入"，要么全拿要么全不拿；结束时按逆序释放。进程在 acquire_many 期间被 SIGKILL / OOM 杀死时，事务未 COMMIT 等于未写，不会残留半截 permit。executor 层不再承担多 lane 之间的 permit 回滚逻辑。
+- `ConcurrencyGovernor` 的 lane 配置由 Host 启动期聚合：Host 默认（只含 `llm_api`）→ Service 业务默认（`SERVICE_DEFAULT_LANE_CONFIG`，含 `write_chapter`、`sec_download`）→ `run.json.host_config.lane` → 显式覆盖，后者覆盖前者。
+- 业务层要读取 lane 上限时走 `HostGovernanceProtocol.get_all_lane_statuses()`（例如写作流水线读 `write_chapter.max_concurrent` 作为 in-process ThreadPoolExecutor 的 worker 上限，保持进程内并发与跨进程 permit 数同源）。
 
 ### 6.4 事件发布能力
 
