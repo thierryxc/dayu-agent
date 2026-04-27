@@ -725,7 +725,7 @@ class Host:
         run = self._run_registry.get_run(run_id)
         if run is None:
             raise KeyError(f"run 不存在: {run_id}")
-        Log.info(f"Host 请求取消 run: run_id={run_id}", module=MODULE)
+        Log.debug(f"Host 请求取消 run: run_id={run_id}", module=MODULE)
         return run
 
     def cancel_session(self, session_id: str) -> tuple[SessionRecord, list[str]]:
@@ -842,7 +842,7 @@ class Host:
             if self._run_registry.request_cancel(run.run_id):
                 cancelled_ids.append(run.run_id)
         if cancelled_ids:
-            Log.info(
+            Log.debug(
                 f"Host 批量取消 session 下活跃 runs: session_id={session_id}, run_ids={','.join(cancelled_ids)}",
                 module=MODULE,
             )
@@ -915,7 +915,7 @@ class Host:
                     module=MODULE,
                 )
         if cancelled_ids:
-            Log.info(
+            Log.debug(
                 f"Host 进程退出前收敛活跃 runs: count={len(cancelled_ids)}, run_ids={','.join(cancelled_ids)}",
                 module=MODULE,
             )
@@ -961,22 +961,27 @@ class Host:
             Log.warn(f"Host 清理 stale reply outbox 失败: {exc}", module=MODULE)
             return []
         if stale_ids:
-            Log.info(
+            Log.debug(
                 f"Host 清理 stale reply outbox: count={len(stale_ids)}, ids={','.join(stale_ids)}",
                 module=MODULE,
             )
         return stale_ids
 
-    def cleanup_stale_pending_turns(self) -> list[str]:
+    def cleanup_stale_pending_turns(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> list[str]:
         """清理关联 run 已终态、且按调和规则应删除的 pending turn。
 
         进程崩溃或启动调和路径上，``_reconcile_pending_turn_after_terminal_run``
         可能未完成调用；而 Host 的 orphan run cleanup 只收敛 run 本身，
         pending turn 会残留至下一次 resume 流程发现。本方法在启动/维护阶段
-        主动扫描所有 pending turn，按终态 run 调和规则做兜底清理。
+        主动扫描 pending turn，按终态 run 调和规则做兜底清理。
 
         Args:
-            无。
+            session_id: 若提供，仅扫描该 session 下的 pending turn；
+                为 ``None`` 时全量扫描。
 
         Returns:
             被清理的 pending_turn_id 列表。
@@ -986,7 +991,7 @@ class Host:
         """
 
         try:
-            records = self._pending_turn_store.list_pending_turns()
+            records = self._pending_turn_store.list_pending_turns(session_id=session_id)
         except Exception as exc:  # pragma: no cover - 防御 DB 异常
             Log.warn(f"Host 扫描 pending turn 失败: {exc}", module=MODULE)
             return []
@@ -1064,19 +1069,19 @@ class Host:
                     continue
                 expired_ids.append(record.pending_turn_id)
         if cleaned_ids:
-            Log.info(
+            Log.debug(
                 f"Host 清理 stale pending turns: count={len(cleaned_ids)}, "
                 f"ids={','.join(cleaned_ids)}",
                 module=MODULE,
             )
         if released_ids:
-            Log.info(
+            Log.debug(
                 f"Host 回退 stale RESUMING pending turns: count={len(released_ids)}, "
                 f"ids={','.join(released_ids)}",
                 module=MODULE,
             )
         if expired_ids:
-            Log.info(
+            Log.debug(
                 f"Host 清理超保留期 pending turns: count={len(expired_ids)}, "
                 f"ids={','.join(expired_ids)}",
                 module=MODULE,

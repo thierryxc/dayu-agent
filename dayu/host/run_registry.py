@@ -243,7 +243,28 @@ class SQLiteRunRegistry(RunRegistryProtocol):
         *,
         cancel_reason: RunCancelReason = RunCancelReason.USER_CANCELLED,
     ) -> RunRecord:
-        """标记 run 已取消。"""
+        """标记 run 已取消。
+
+        幂等：如果 run 已处于 CANCELLED 状态，直接返回当前记录，
+        避免 executor 取消路径与 signal handler shutdown 路径竞态时
+        触发「cancelled -> cancelled」非法状态转换。
+        """
+
+        conn = self._host_store.get_connection()
+        with write_transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"run 不存在: {run_id}")
+            current_state = RunState(row["state"])
+            if current_state == RunState.CANCELLED:
+                Log.debug(
+                    f"mark_cancelled 幂等跳过: run 已处于 CANCELLED 状态, run_id={run_id}",
+                    module=MODULE,
+                )
+                return _row_to_record(dict(row))
 
         return self._transition(
             run_id,
@@ -308,7 +329,7 @@ class SQLiteRunRegistry(RunRegistryProtocol):
             )
             rowcount = cursor.rowcount
         if rowcount > 0:
-            Log.info(
+            Log.debug(
                 f"登记 run 取消请求: run_id={run_id}, cancel_reason={cancel_reason.value}",
                 module=MODULE,
             )
@@ -453,7 +474,7 @@ class SQLiteRunRegistry(RunRegistryProtocol):
                     if cursor.rowcount > 0:
                         orphan_ids.append(oid)
             if orphan_ids:
-                Log.info(
+                Log.debug(
                     f"清理 orphan runs -> UNSETTLED: count={len(orphan_ids)}, run_ids={','.join(orphan_ids)}",
                     module=MODULE,
                 )
